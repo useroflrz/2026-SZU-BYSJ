@@ -3,7 +3,6 @@ import { defineStore } from 'pinia'
 export const useAnalysisStore = defineStore('analysis', {
   state: () => ({
     stations: [],
-    gridPoints: [],
     analysisResult: null,
     analysisProgress: 0,
     isAnalyzing: false,
@@ -14,7 +13,6 @@ export const useAnalysisStore = defineStore('analysis', {
 
   getters: {
     stationCount: (state) => state.stations.length,
-    gridPointCount: (state) => state.gridPoints.length,
     hasResults: (state) => state.analysisResult !== null
   },
 
@@ -45,76 +43,6 @@ export const useAnalysisStore = defineStore('analysis', {
       }
     },
 
-    generateGrid(bounds, { dx, dy, dz, zMin, zMax }) {
-      // 将经纬度范围转换为粗略米（考虑纬度对经度长度的影响）
-      const centerLatDeg = (bounds.minLat + bounds.maxLat) * 0.5
-      const centerLatRad = (centerLatDeg * Math.PI) / 180.0
-      const metersPerDegLat = 111000.0
-      const metersPerDegLon = 111000.0 * Math.cos(centerLatRad)
-
-      const widthM = Math.max(
-        0,
-        (bounds.maxLon - bounds.minLon) * metersPerDegLon
-      )
-      const heightM = Math.max(
-        0,
-        (bounds.maxLat - bounds.minLat) * metersPerDegLat
-      )
-
-      // 根据选定区域面积和格网尺寸计算格网数量，使用向上取整使格网完全覆盖选定区域
-      // 按用户给定的 dx/dy/dz 严格生成格网，不再自动放大步长
-      const zCount = Math.max(1, Math.ceil((zMax - zMin) / dz))
-
-      const xCount = Math.max(1, Math.ceil(widthM / dx))
-      const yCount = Math.max(1, Math.ceil(heightM / dy))
-      const total = xCount * yCount * zCount
-      const capped = false
-
-      const lonStep = dx / Math.max(1e-9, metersPerDegLon)
-      const latStep = dy / metersPerDegLat
-      // 格网中心从边界内半格起步，使格网均匀铺满并覆盖区域
-      const lonStart = bounds.minLon + 0.5 * lonStep
-      const latStart = bounds.minLat + 0.5 * latStep
-
-      const points = []
-      for (let ix = 0; ix < xCount; ix++) {
-        for (let iy = 0; iy < yCount; iy++) {
-          for (let iz = 0; iz < zCount; iz++) {
-            const lon = lonStart + ix * lonStep
-            const lat = latStart + iy * latStep
-            const height = zMin + iz * dz
-            points.push({ lon, lat, height })
-          }
-        }
-      }
-
-      this.gridPoints = points
-
-      // 记录格网元数据，供后续按层统计与筛选
-      this.gridMeta = {
-        bounds,
-        dx,
-        dy,
-        dz,
-        zMin,
-        zMax,
-        xCount,
-        yCount,
-        zCount,
-        totalEstimate: total,
-        sampledCount: points.length
-      }
-
-      return {
-        sampledCount: points.length,
-        totalEstimate: total,
-        layerCount: zCount,
-        pointsPerLayerEstimate: xCount * yCount,
-        capped,
-        usedDx: dx,
-        usedDy: dy
-      }
-    },
 
     setAnalysisResult(result) {
       this.analysisResult = result
@@ -135,13 +63,10 @@ export const useAnalysisStore = defineStore('analysis', {
       this.layerStats = []
 
       // 模拟：按网格点生成可见性结果，简单随机
-      const total = this.gridPoints.length
+      const total = this.gridMeta ? this.gridMeta.totalEstimate || 0 : 0
 
       // 先根据简单规则给每个格网点生成可视性结果
-      const baseResults = this.gridPoints.map(pt => ({
-        ...pt,
-        visible: Math.random() > 0.35 // 约 65% 可视（示意用）
-      }))
+      const baseResults = []
 
       // 如果有格网元数据，则根据高度映射出所属层索引，便于结果按层统计/筛选
       let results = baseResults

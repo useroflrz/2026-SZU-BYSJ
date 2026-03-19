@@ -1,16 +1,7 @@
 <template>
   <div class="grid-config">
     <el-form :model="form" label-width="120px" size="small">
-      <el-form-item label="网格类型">
-        <el-radio-group v-model="form.gridType">
-          <el-radio label="regular">规则网格</el-radio>
-          <el-radio label="beidou">北斗网格</el-radio>
-        </el-radio-group>
-      </el-form-item>
-
-      <el-divider />
-
-      <el-form-item label="渲染样式" v-if="form.gridType === 'beidou'">
+      <el-form-item label="渲染样式">
         <div class="style-inputs">
           <div class="style-row">
             <span class="style-label">面颜色</span>
@@ -83,7 +74,7 @@
 
       <el-divider />
 
-      <el-form-item label="高度范围">
+      <el-form-item label="离地高度范围">
         <div class="height-range-inputs">
           <el-form-item label="Z_MIN(米)" label-width="80px">
             <el-input-number
@@ -183,7 +174,6 @@ const analysisStore = useAnalysisStore()
 const mapStore = useMapStore()
 
 const form = reactive({
-  gridType: 'regular',
   dx: 100,
   dy: 100,
   dz: 50,
@@ -247,81 +237,41 @@ const generateGrid = async () => {
   }
 
   isGenerating.value = true
-  ElMessage.info('正在生成格网...')
+  ElMessage.info('正在生成格网（将采样地形高程以贴地）...')
 
-  setTimeout(() => {
-    let result = null
-    if (form.gridType === 'regular') {
-      result = analysisStore.generateGrid(bounds, {
-        dx: form.dx,
-        dy: form.dy,
-        dz: form.dz,
-        zMin: form.zMin,
-        zMax: form.zMax
-      })
+  try {
+    // 北斗网格：使用自定义 Primitive 做 3D 网格渲染
+    mapStore.setGridPoints([]) // 不再用点图层
+    const primitiveInfo = await mapStore.showBeiDouGrid(bounds, {
+      dx: form.dx,
+      dy: form.dy,
+      dz: form.dz,
+      zMin: form.zMin,
+      zMax: form.zMax,
+      fillColor: form.fillColor,
+      fillOpacity: form.fillOpacity,
+      outlineColor: form.outlineColor,
+      outlineOpacity: form.outlineOpacity
+    })
+    if (primitiveInfo == null) {
+      ElMessage.warning('地图未就绪，格网未渲染。请等待 3D 地图加载完成后再点击「生成格网」。')
+      return
     }
 
-    let primitiveInfo = null
-
-    // 根据网格类型决定如何在地图上展示和统计
-    if (form.gridType === 'regular') {
-      // 原有行为：用点表示格网
-      mapStore.setGridPoints(analysisStore.gridPoints)
-      mapStore.clearBeiDouGrid()
-    } else if (form.gridType === 'beidou') {
-      // 北斗网格：使用自定义 Primitive 做 3D 网格渲染
-      mapStore.setGridPoints([]) // 不再用点图层
-      primitiveInfo = mapStore.showBeiDouGrid(bounds, {
-        dx: form.dx,
-        dy: form.dy,
-        dz: form.dz,
-        zMin: form.zMin,
-        zMax: form.zMax,
-        fillColor: form.fillColor,
-        fillOpacity: form.fillOpacity,
-        outlineColor: form.outlineColor,
-        outlineOpacity: form.outlineOpacity
-      })
-      if (primitiveInfo == null) {
-        ElMessage.warning('地图未就绪，格网未渲染。请等待 3D 地图加载完成后再点击「生成格网」。')
-        isGenerating.value = false
-        return
-      }
+    gridInfo.value = {
+      pointCount: primitiveInfo.total,
+      layerCount: primitiveInfo.layerCount,
+      pointsPerLayer: primitiveInfo.pointsPerLayer
     }
 
-    if (form.gridType === 'regular' && result) {
-      gridInfo.value = {
-        pointCount: result.totalEstimate,
-        layerCount: result.layerCount,
-        pointsPerLayer: result.pointsPerLayerEstimate
-      }
-      if (result.capped) {
-        ElMessage.warning(
-          `格网数量过多，已自动降低密度以防浏览器崩溃（等效 DX/DY≈${result.usedDx.toFixed(1)}/${result.usedDy.toFixed(1)} 米）。建议增大格网尺寸或缩小选定区域。`
-        )
-      }
-    } else if (form.gridType === 'beidou' && primitiveInfo) {
-      gridInfo.value = {
-        pointCount: primitiveInfo.total,
-        layerCount: primitiveInfo.layerCount,
-        pointsPerLayer: primitiveInfo.pointsPerLayer
-      }
-      if (primitiveInfo.capped) {
-        ElMessage.warning(
-          `格网数量过多，已自动降低显示密度以防浏览器崩溃（等效 DX/DY≈${primitiveInfo.usedDx.toFixed(1)}/${primitiveInfo.usedDy.toFixed(1)} 米）。建议增大格网尺寸或缩小选定区域。`
-        )
-      }
-    }
-
-    isGenerating.value = false
     ElMessage.success(
-      `格网生成完成，共 ${(
-        form.gridType === 'beidou' && primitiveInfo
-          ? primitiveInfo.total
-          : (result ? result.totalEstimate : 0)
-      ).toLocaleString()} 个格网单元（已覆盖选定区域）`
+      `格网生成完成，共 ${primitiveInfo.total.toLocaleString()} 个格网单元（已贴地，离地高度范围：${form.zMin}~${form.zMax}m）`
     )
-  }, 400)
+  } catch (e) {
+    ElMessage.error(`格网生成失败：${e?.message || '未知错误'}`)
+  } finally {
+    isGenerating.value = false
+  }
 }
 
 const resetForm = () => {

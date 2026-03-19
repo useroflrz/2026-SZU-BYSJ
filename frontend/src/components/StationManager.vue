@@ -524,7 +524,6 @@ const handleFileImport = (file) => {
         ElMessage.success(`已导入 ${parsed.length} 个站点`)
       }
     } catch (err) {
-      console.error(err)
       ElMessage.error('导入失败，请检查文件格式')
     }
   }

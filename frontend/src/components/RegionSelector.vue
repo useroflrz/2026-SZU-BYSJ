@@ -274,7 +274,8 @@ const confirmRegion = () => {
     bounds: bounds.value,
     area: area.value
   })
-  mapStore.drawRegion(bounds.value, regionName.value)
+  // 选定前在地图上保留蓝色矩形预览，点击“确认区域”后移除预览矩形
+  mapStore.removeRegionRectangleOnly()
   
   ElMessage.success('区域已确认')
 }

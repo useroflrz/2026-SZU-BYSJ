@@ -74,6 +74,23 @@ onMounted(async () => {
     fullscreenButton: true
   })
 
+  // 地形异常兜底：一旦 terrain tile 请求报错，自动回退椭球地形，避免持续报错影响渲染/交互
+  try {
+    const tp = viewer.terrainProvider
+    if (tp && tp.errorEvent && typeof tp.errorEvent.addEventListener === 'function') {
+      tp.errorEvent.addEventListener((err) => {
+        console.warn('地形瓦片请求失败，回退到椭球地形：', err)
+        try {
+          viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider()
+        } catch (e) {
+          // ignore
+        }
+      })
+    }
+  } catch (e) {
+    // ignore
+  }
+
   // 设置初始视角（深圳）
   viewer.camera.setView({
     destination: Cesium.Cartesian3.fromDegrees(114.0579, 22.5431, 5000)
@@ -82,11 +99,24 @@ onMounted(async () => {
   // 保存 viewer 实例到 store
   mapStore.setViewer(viewer)
 
-  // 鼠标拾取北斗格网单元
+  // 鼠标拾取北斗格网单元（geometryInstances 走 Cesium pick，instanced 走 GPU 拾取）
   clickHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas)
   clickHandler.setInputAction((movement) => {
+    let id = null
     const picked = viewer.scene.pick(movement.position)
-    const id = picked && picked.id
+    if (picked && picked.id) id = picked.id
+    if ((typeof id !== 'string' || !id.startsWith('beidou-cell-')) && mapStore.beiDouGridMeta?.renderMode === 'instanced' && mapStore.beiDouGridPrimitive?.pick) {
+      const globalId = mapStore.beiDouGridPrimitive.pick(viewer.scene, movement.position.x, movement.position.y)
+      if (globalId >= 0 && mapStore.beiDouGridMeta) {
+        const { gridX, gridY, gridZ } = mapStore.beiDouGridMeta
+        const layerSize = gridX * gridY
+        const iz = Math.floor(globalId / layerSize)
+        const rem = globalId % layerSize
+        const iy = Math.floor(rem / gridX)
+        const ix = rem % gridX
+        id = `beidou-cell-${ix}-${iy}-${iz}`
+      }
+    }
     if (typeof id === 'string' && id.startsWith('beidou-cell-')) {
       mapStore.selectBeiDouCell(id)
     } else {
