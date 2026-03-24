@@ -337,8 +337,7 @@ const handleOutlineStyleChange = () => {
   if (!mapStore.beiDouGridMeta) return
   if (!mapStore.viewer) return
 
-  // 大规模 instanced 模式没有全量边框几何，但选中单元会有 overlay entity
-  // 承载 outlineColor/outLineOpacity，因此这里需要同步 overlay。
+  // 大规模 instanced 模式下：更新主网格线框样式后，重施选中高亮 Primitive。
   if (mapStore.beiDouGridMeta.renderMode === 'instanced') {
     try {
       const color = (form.outlineColor
@@ -354,13 +353,10 @@ const handleOutlineStyleChange = () => {
           color
         })
       }
-
-      const overlayEntityId = mapStore.beiDouGridSelectedOverlay
-      if (overlayEntityId) {
-        const overlayEntity = mapStore.viewer.entities.getById(overlayEntityId)
-        if (overlayEntity?.box) {
-          overlayEntity.box.outlineColor = Cesium.Color.RED.withAlpha(color.alpha)
-        }
+      if (mapStore.selectedBeiDouCellId) {
+        mapStore.selectBeiDouCell(mapStore.selectedBeiDouCellId)
+      } else if (mapStore.viewer?.scene?.requestRender) {
+        mapStore.viewer.scene.requestRender()
       }
     } catch (e) {
       // ignore
@@ -393,6 +389,13 @@ const handleOutlineStyleChange = () => {
     }
 
     mapStore.beiDouGridMeta.outlineColor = color
+
+    // 批量更新边框样式后，重新施加当前选中高亮，避免选中态被覆盖。
+    if (mapStore.selectedBeiDouCellId) {
+      mapStore.selectBeiDouCell(mapStore.selectedBeiDouCellId)
+    } else if (mapStore.viewer?.scene?.requestRender) {
+      mapStore.viewer.scene.requestRender()
+    }
   } catch (e) {
     // 忽略运行时错误，避免阻断交互
   }

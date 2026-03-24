@@ -107,8 +107,8 @@ export const useMapStore = defineStore('map', {
     beiDouGridOutlinePrimitive: null,
     beiDouGridInstancedPrimitives: [],
     beiDouGridMeta: null,
-    // instanced 模式下的选中格子高亮框：用 Entity 实现，避免 Primitive destroy 带来的拾取竞态
-    beiDouGridSelectedOverlay: null, // entityId (string) or null
+    // instanced 模式下的选中格子高亮：使用官方 Primitive + GeometryInstance
+    beiDouGridSelectedPrimitive: null,
     selectedBeiDouCellId: null,
     selectedBeiDouCellInfo: null
   }),
@@ -679,14 +679,7 @@ export const useMapStore = defineStore('map', {
 
       removePrimitiveSafe(this.beiDouGridPrimitive)
       removePrimitiveSafe(this.beiDouGridOutlinePrimitive)
-      // selected overlay 用 Entity，避免 destroy 相关竞态
-      if (this.beiDouGridSelectedOverlay && this.viewer?.entities) {
-        try {
-          this.viewer.entities.removeById(this.beiDouGridSelectedOverlay)
-        } catch (e) {
-          // ignore
-        }
-      }
+      removePrimitiveSafe(this.beiDouGridSelectedPrimitive)
       if (Array.isArray(this.beiDouGridInstancedPrimitives)) {
         this.beiDouGridInstancedPrimitives.forEach(p => removePrimitiveSafe(p))
       }
@@ -695,7 +688,7 @@ export const useMapStore = defineStore('map', {
       this.beiDouGridOutlinePrimitive = null
       this.beiDouGridInstancedPrimitives = []
       this.beiDouGridMeta = null
-      this.beiDouGridSelectedOverlay = null
+      this.beiDouGridSelectedPrimitive = null
       this.selectedBeiDouCellId = null
       this.selectedBeiDouCellInfo = null
     },
@@ -707,7 +700,15 @@ export const useMapStore = defineStore('map', {
       if (!this.viewer || !this.beiDouGridPrimitive) return
 
       const primitive = this.beiDouGridPrimitive
+      const outlinePrimitive = this.beiDouGridOutlinePrimitive
       const isInstanced = this.beiDouGridMeta && this.beiDouGridMeta.renderMode === 'instanced'
+      const requestRenderSafe = () => {
+        try {
+          if (this.viewer?.scene?.requestRender) this.viewer.scene.requestRender()
+        } catch (e) {
+          // ignore
+        }
+      }
 
       // geometryInstances 模式才支持逐实例改色
       if (!isInstanced && this.selectedBeiDouCellId) {
@@ -720,21 +721,31 @@ export const useMapStore = defineStore('map', {
         } catch (e) {
           // ignore
         }
+        try {
+          if (outlinePrimitive) {
+            const prevOutlineAttr = outlinePrimitive.getGeometryInstanceAttributes(this.selectedBeiDouCellId)
+            if (prevOutlineAttr && prevOutlineAttr.color) {
+              const baseOutlineColor = this.beiDouGridMeta?.outlineColor || Cesium.Color.BLACK.withAlpha(0.8)
+              prevOutlineAttr.color = Cesium.ColorGeometryInstanceAttribute.toValue(baseOutlineColor)
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
       }
 
       if (!cellId) {
-        if (this.beiDouGridSelectedOverlay) {
+        if (this.beiDouGridSelectedPrimitive) {
           try {
-            if (this.viewer?.entities) {
-              this.viewer.entities.removeById(this.beiDouGridSelectedOverlay)
-            }
+            // 不释放资源，仅隐藏高亮 Primitive，便于后续复用。
+            this.beiDouGridSelectedPrimitive.show = false
           } catch (e) {
             // ignore
           }
-          this.beiDouGridSelectedOverlay = null
         }
         this.selectedBeiDouCellId = null
         this.selectedBeiDouCellInfo = null
+        requestRenderSafe()
         return
       }
 
@@ -745,6 +756,20 @@ export const useMapStore = defineStore('map', {
             attr.color = Cesium.ColorGeometryInstanceAttribute.toValue(
               new Cesium.Color(1.0, 0.0, 0.0, 0.8)
             )
+          }
+        } catch (e) {
+          // ignore
+        }
+        try {
+          if (outlinePrimitive) {
+            const attr = outlinePrimitive.getGeometryInstanceAttributes(cellId)
+            if (attr && attr.color) {
+              const metaOutlineColor = this.beiDouGridMeta?.outlineColor
+              const selectedOutlineColor = Cesium.Color.RED.withAlpha(
+                Number.isFinite(metaOutlineColor?.alpha) ? metaOutlineColor.alpha : 0.95
+              )
+              attr.color = Cesium.ColorGeometryInstanceAttribute.toValue(selectedOutlineColor)
+            }
           }
         } catch (e) {
           // ignore
@@ -794,12 +819,9 @@ export const useMapStore = defineStore('map', {
             dx: metaDx, dy: metaDy, dz: metaDz
           }
 
-          // instanced 模式：用单独的覆盖 Primitive 高亮选中格子（只渲染 1 个盒子）
+          // instanced 模式：使用官方 Primitive + GeometryInstance 创建单格线框高亮
           if (isInstanced) {
             try {
-              const halfW = metaDx * 0.5
-              const halfL = metaDy * 0.5
-              const halfH = metaDz * 0.5
               const colIndex = iy * metaGridX + ix
               const groundH = groundHeights?.[colIndex] ?? originGroundHeight
               const localTranslation = new Cesium.Cartesian3(
@@ -812,48 +834,55 @@ export const useMapStore = defineStore('map', {
                 localTranslation,
                 new Cesium.Matrix4()
               )
-              // Entity box 用 position + orientation，而不是 Primitive 的 destroy/recreate
-              const worldCenter = Cesium.Matrix4.getTranslation(modelMatrix, new Cesium.Cartesian3())
-              const rot = Cesium.Matrix3.fromMatrix4(modelMatrix, new Cesium.Matrix3())
-              const orientation = Cesium.Quaternion.fromRotationMatrix(rot, new Cesium.Quaternion())
 
-              const overlayEntityId = 'beidou-grid-selected-overlay'
-              let overlayEntity = this.viewer.entities.getById(overlayEntityId)
               const metaOutlineColor = this.beiDouGridMeta?.outlineColor
               const selectedOutlineColor = Cesium.Color.RED.withAlpha(
                 Number.isFinite(metaOutlineColor?.alpha) ? metaOutlineColor.alpha : 0.95
               )
-              if (!overlayEntity) {
-                overlayEntity = this.viewer.entities.add({
-                  id: overlayEntityId,
-                  name: '北斗格网选中高亮',
-                  position: worldCenter,
-                  orientation,
-                  box: {
-                    dimensions: new Cesium.Cartesian3(metaDx, metaDy, metaDz),
-                    fill: false,
-                    outline: true,
-                    // 选中单元边框固定红色，透明度沿用当前边框透明度设置。
-                    outlineColor: selectedOutlineColor,
-                    outlineWidth: 2
+              if (this.beiDouGridSelectedPrimitive) {
+                // 复用已有 Primitive：仅更新 modelMatrix / 颜色 / 显示状态。
+                this.beiDouGridSelectedPrimitive.modelMatrix = modelMatrix
+                this.beiDouGridSelectedPrimitive.show = true
+                try {
+                  const attr = this.beiDouGridSelectedPrimitive.getGeometryInstanceAttributes('beidou-selected-cell')
+                  if (attr && attr.color) {
+                    attr.color = Cesium.ColorGeometryInstanceAttribute.toValue(selectedOutlineColor)
+                  }
+                } catch (e) {
+                  // ignore attribute update errors
+                }
+              } else {
+                const highlightGeometry = new Cesium.BoxOutlineGeometry({
+                  minimum: new Cesium.Cartesian3(-metaDx * 0.5, -metaDy * 0.5, -metaDz * 0.5),
+                  maximum: new Cesium.Cartesian3(metaDx * 0.5, metaDy * 0.5, metaDz * 0.5)
+                })
+                const highlightInstance = new Cesium.GeometryInstance({
+                  id: 'beidou-selected-cell',
+                  geometry: highlightGeometry,
+                  modelMatrix: Cesium.Matrix4.IDENTITY,
+                  attributes: {
+                    color: Cesium.ColorGeometryInstanceAttribute.fromColor(selectedOutlineColor)
                   }
                 })
-                this.beiDouGridSelectedOverlay = overlayEntityId
-              } else {
-                overlayEntity.position = worldCenter
-                overlayEntity.orientation = orientation
-                if (overlayEntity.box) {
-                  overlayEntity.box.dimensions = new Cesium.Cartesian3(metaDx, metaDy, metaDz)
-                  overlayEntity.box.outlineColor = selectedOutlineColor
-                }
+                const highlightPrimitive = new Cesium.Primitive({
+                  geometryInstances: [highlightInstance],
+                  modelMatrix,
+                  appearance: new Cesium.PerInstanceColorAppearance({
+                    translucent: true,
+                    flat: true
+                  })
+                })
+                this.viewer.scene.primitives.add(highlightPrimitive)
+                this.beiDouGridSelectedPrimitive = highlightPrimitive
               }
             } catch (e) {
-              // ignore overlay errors
-              this.beiDouGridSelectedOverlay = null
+              // ignore highlight primitive errors
+              this.beiDouGridSelectedPrimitive = null
             }
           }
         }
       }
+      requestRenderSafe()
     }
   }
 })
