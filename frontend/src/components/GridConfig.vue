@@ -265,7 +265,7 @@ const generateGrid = async () => {
     }
 
     ElMessage.success(
-      `格网生成完成，共 ${primitiveInfo.total.toLocaleString()} 个格网单元（已贴地，离地高度范围：${form.zMin}~${form.zMax}m）`
+      `格网生成完成，共 ${primitiveInfo.total.toLocaleString()} 个格网单元（已贴地：terrain采样，离地高度范围：${form.zMin}~${form.zMax}m）`
     )
   } catch (e) {
     ElMessage.error(`格网生成失败：${e?.message || '未知错误'}`)
@@ -297,7 +297,6 @@ const resetForm = () => {
 }
 
 const safeUpdateBeiDouFillStyle = () => {
-  if (form.gridType !== 'beidou') return
   if (!mapStore.beiDouGridPrimitive || !mapStore.beiDouGridMeta) return
   if (!mapStore.viewer) return
   if (mapStore.beiDouGridMeta.renderMode === 'instanced') return
@@ -335,10 +334,41 @@ const handleFillStyleChange = () => {
 
 const handleOutlineStyleChange = () => {
   // 仅在用户松手后更新 3D 格网线框的颜色与透明度
-  if (form.gridType !== 'beidou') return
-  if (!mapStore.beiDouGridOutlinePrimitive || !mapStore.beiDouGridMeta) return
+  if (!mapStore.beiDouGridMeta) return
   if (!mapStore.viewer) return
-  if (mapStore.beiDouGridMeta.renderMode === 'instanced') return
+
+  // 大规模 instanced 模式没有全量边框几何，但选中单元会有 overlay entity
+  // 承载 outlineColor/outLineOpacity，因此这里需要同步 overlay。
+  if (mapStore.beiDouGridMeta.renderMode === 'instanced') {
+    try {
+      const color = (form.outlineColor
+        ? Cesium.Color.fromCssColorString(form.outlineColor)
+        : Cesium.Color.BLACK
+      ).withAlpha(
+        typeof form.outlineOpacity === 'number' ? form.outlineOpacity : 0.8
+      )
+
+      mapStore.beiDouGridMeta.outlineColor = color
+      if (mapStore.beiDouGridPrimitive?.setWireframeStyle) {
+        mapStore.beiDouGridPrimitive.setWireframeStyle({
+          color
+        })
+      }
+
+      const overlayEntityId = mapStore.beiDouGridSelectedOverlay
+      if (overlayEntityId) {
+        const overlayEntity = mapStore.viewer.entities.getById(overlayEntityId)
+        if (overlayEntity?.box) {
+          overlayEntity.box.outlineColor = Cesium.Color.RED.withAlpha(color.alpha)
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+    return
+  }
+
+  if (!mapStore.beiDouGridOutlinePrimitive) return
 
   try {
     const { gridX, gridY, gridZ } = mapStore.beiDouGridMeta

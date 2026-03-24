@@ -1,6 +1,90 @@
 import { defineStore } from 'pinia'
 import * as Cesium from 'cesium'
+import { markRaw, toRaw } from 'vue'
 import { BeiDouGridPrimitive, createGridInstancesFromBounds } from '../Rendering/BeiDouGridPrimitive'
+
+async function sampleGridGroundHeights(viewer, normalizedBounds, originLon, originLat, dx, dy, gridX, gridY, options = {}) {
+  const {
+    batchSize = 200,
+    defaultHeight = 0
+  } = options
+
+  // Cesium 在某些 Vue3 情况下，若 viewer 是响应式 Proxy，会在 tile availability 计算阶段触发渲染停止错误。
+  // 这里强制解包，确保传入 Cesium 的 viewer/terrainProvider 是“原始对象”。
+  const rawViewer = toRaw(viewer)
+  const terrainProvider = rawViewer?.terrainProvider
+  const groundHeights = new Float32Array(gridX * gridY)
+
+  if (!terrainProvider || gridX <= 0 || gridY <= 0) {
+    groundHeights.fill(defaultHeight)
+    return { originGroundHeight: defaultHeight, groundHeights }
+  }
+
+  try {
+    // 预等待 terrain 可用性，避免部分情况下 sampleTerrainMostDetailed 直接失败
+    if (terrainProvider.readyPromise) {
+      await terrainProvider.readyPromise
+    }
+  } catch (e) {
+    // ignore and fallback to defaultHeight
+  }
+
+  const centerLatDeg = (normalizedBounds.minLat + normalizedBounds.maxLat) * 0.5
+  const centerLatRad = Cesium.Math.toRadians(centerLatDeg)
+  const metersPerDegLat = 111000.0
+  const metersPerDegLon = 111000.0 * Math.cos(centerLatRad)
+  const safeMetersPerDegLon = Math.max(1e-9, metersPerDegLon)
+
+  const safeSample = async (cartos) => {
+    // sampleTerrainMostDetailed 会原地更新 cartos[i].height
+    return Cesium.sampleTerrainMostDetailed(terrainProvider, cartos)
+  }
+
+  let originGroundHeight = defaultHeight
+  try {
+    const originCarto = Cesium.Cartographic.fromDegrees(originLon, originLat)
+    await safeSample([originCarto])
+    originGroundHeight = Number.isFinite(originCarto.height) ? originCarto.height : defaultHeight
+  } catch (e) {
+    originGroundHeight = defaultHeight
+  }
+
+  // 按 (ix,iy) 的柱中心点采样地形高度（gridZ 层不参与采样，避免乘法爆炸）
+  const totalCols = gridX * gridY
+  for (let start = 0; start < totalCols; start += batchSize) {
+    const end = Math.min(totalCols, start + batchSize)
+    const cartos = []
+    const idxs = []
+
+    for (let linear = start; linear < end; linear++) {
+      const ix = linear % gridX
+      const iy = Math.floor(linear / gridX)
+
+      const localX = (ix + 0.5) * dx
+      const localY = (iy + 0.5) * dy
+      const lon = originLon + localX / safeMetersPerDegLon
+      const lat = originLat + localY / metersPerDegLat
+
+      cartos.push(Cesium.Cartographic.fromDegrees(lon, lat))
+      idxs.push(linear)
+    }
+
+    try {
+      await safeSample(cartos)
+      for (let j = 0; j < cartos.length; j++) {
+        const h = cartos[j]?.height
+        groundHeights[idxs[j]] = Number.isFinite(h) ? h : defaultHeight
+      }
+    } catch (e) {
+      // 采样批失败时，回退这批柱为默认高度，保证功能可用
+      for (let linear = start; linear < end; linear++) {
+        groundHeights[linear] = defaultHeight
+      }
+    }
+  }
+
+  return { originGroundHeight, groundHeights }
+}
 
 // 简单的实体/集合管理器，集中存储各类图层的 ids，便于销毁/显隐
 const defaultLayerState = () => ({
@@ -23,7 +107,8 @@ export const useMapStore = defineStore('map', {
     beiDouGridOutlinePrimitive: null,
     beiDouGridInstancedPrimitives: [],
     beiDouGridMeta: null,
-    beiDouGridSelectedOverlay: null,
+    // instanced 模式下的选中格子高亮框：用 Entity 实现，避免 Primitive destroy 带来的拾取竞态
+    beiDouGridSelectedOverlay: null, // entityId (string) or null
     selectedBeiDouCellId: null,
     selectedBeiDouCellInfo: null
   }),
@@ -34,8 +119,35 @@ export const useMapStore = defineStore('map', {
   },
 
   actions: {
+    schedulePrimitiveDestroy(primitive) {
+      if (!primitive) return
+      try {
+        const isDestroyed =
+          typeof primitive.isDestroyed === 'function' ? primitive.isDestroyed() : false
+        if (isDestroyed) return
+
+        const doDestroy = () => {
+          try {
+            if (typeof primitive.destroy === 'function') primitive.destroy()
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        // 延迟到下一帧再销毁，避免 Cesium 在同一帧的 pick/render 过程中仍引用对象
+        if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+          window.requestAnimationFrame(() => doDestroy())
+        } else {
+          setTimeout(doDestroy, 0)
+        }
+      } catch (e) {
+        // ignore
+      }
+    },
+
     setViewer(viewer) {
-      this.viewer = viewer
+      // markRaw 避免把 Cesium Viewer 包进 Vue 响应式系统（可减少/避免异步 tile 计算的竞态问题）。
+      this.viewer = markRaw(viewer)
     },
 
     setCenter(lon, lat) {
@@ -268,7 +380,7 @@ export const useMapStore = defineStore('map', {
     /**
      * 使用 Cesium 官方 Primitive/GeometryInstance API 展示北斗 3D 网格
      */
-    showBeiDouGrid(bounds, gridParams) {
+    async showBeiDouGrid(bounds, gridParams) {
       if (!this.viewer) {
         console.warn('[map] showBeiDouGrid: viewer 未初始化，格网未渲染。请确保地图已加载完成。')
         return null
@@ -330,8 +442,23 @@ export const useMapStore = defineStore('map', {
 
       const originLon = normalizedBounds.minLon
       const originLat = normalizedBounds.minLat
-      const zStart = zMin
-      const originCartesian = Cesium.Cartesian3.fromDegrees(originLon, originLat, zStart)
+
+      // 采样地形高度：用户输入的 zMin/zMax 是“离地高度（相对 terrain）”，
+      // 因此需要把每个 (ix,iy) 柱的地形高度 groundHeight 映射到 ENU 的 Up 轴偏移。
+      const { originGroundHeight, groundHeights } = await sampleGridGroundHeights(
+        this.viewer,
+        normalizedBounds,
+        originLon,
+        originLat,
+        dx,
+        dy,
+        gridX,
+        gridY,
+        { batchSize: 200, defaultHeight: 0 }
+      )
+
+      const zMinRel = zMin
+      const originCartesian = Cesium.Cartesian3.fromDegrees(originLon, originLat, originGroundHeight)
       const originENU = Cesium.Transforms.eastNorthUpToFixedFrame(originCartesian)
 
       // debug-only origin print removed (kept minimal)
@@ -370,11 +497,14 @@ export const useMapStore = defineStore('map', {
         const outlineGeometryInstances = []
         for (let ix = 0; ix < gridX; ix++) {
           for (let iy = 0; iy < gridY; iy++) {
+            const colIndex = iy * gridX + ix
+            const groundH = groundHeights?.[colIndex] ?? originGroundHeight
             for (let iz = 0; iz < gridZ; iz++) {
+              const centerZRel = zMinRel + (iz + 0.5) * dz + (groundH - originGroundHeight)
               const localTranslation = new Cesium.Cartesian3(
                 (ix + 0.5) * dx,
                 (iy + 0.5) * dy,
-                (iz + 0.5) * dz
+                centerZRel
               )
               const modelMatrix = Cesium.Matrix4.multiplyByTranslation(
                 originENU,
@@ -438,7 +568,14 @@ export const useMapStore = defineStore('map', {
         const gridData = createGridInstancesFromBounds(
           normalizedBounds,
           { dx, dy, dz, zMin, zMax },
-          { origin: 'minCorner' }
+          {
+            origin: 'minCorner',
+            originGroundHeight,
+            groundHeights,
+            gridX,
+            gridY,
+            gridZ
+          }
         )
 
         const primitive = new BeiDouGridPrimitive(
@@ -453,7 +590,10 @@ export const useMapStore = defineStore('map', {
             boundingSphere: gridData.boundingSphere,
             wireframe: {
               show: true,
-              color: baseFillColor,
+              fillColor: baseFillColor,
+              color: baseOutlineColor,
+              halfSize: new Cesium.Cartesian3(halfWidth, halfLength, halfHeight),
+              edgeRatio: 0.01,
               visibleDistance: 1e9
             },
             debug: import.meta.env?.DEV
@@ -472,18 +612,24 @@ export const useMapStore = defineStore('map', {
         dx,
         dy,
         dz,
+        // 用户输入的离地高度（相对 terrain 的“离地高度”语义）
         zMin,
         zMax,
+        zMinRel: zMin,
+        zMaxRel: zMax,
+        // ENU 原点（originLon,originLat）处：绝对椭球高度 = originGroundHeight + zMin
+        zStartAbsOrigin: originGroundHeight + zMin,
         gridX,
         gridY,
         gridZ,
         renderedCount,
         renderStep: 1,
-        zStart,
+        originGroundHeight,
         originLon,
         originLat,
         originCartesian,
         originENU,
+        groundHeights,
         fillColor: baseFillColor,
         outlineColor: baseOutlineColor,
         renderMode: useInstancing ? 'instanced' : 'geometryInstances'
@@ -533,7 +679,14 @@ export const useMapStore = defineStore('map', {
 
       removePrimitiveSafe(this.beiDouGridPrimitive)
       removePrimitiveSafe(this.beiDouGridOutlinePrimitive)
-      removePrimitiveSafe(this.beiDouGridSelectedOverlay)
+      // selected overlay 用 Entity，避免 destroy 相关竞态
+      if (this.beiDouGridSelectedOverlay && this.viewer?.entities) {
+        try {
+          this.viewer.entities.removeById(this.beiDouGridSelectedOverlay)
+        } catch (e) {
+          // ignore
+        }
+      }
       if (Array.isArray(this.beiDouGridInstancedPrimitives)) {
         this.beiDouGridInstancedPrimitives.forEach(p => removePrimitiveSafe(p))
       }
@@ -572,9 +725,8 @@ export const useMapStore = defineStore('map', {
       if (!cellId) {
         if (this.beiDouGridSelectedOverlay) {
           try {
-            this.viewer.scene.primitives.remove(this.beiDouGridSelectedOverlay)
-            if (typeof this.beiDouGridSelectedOverlay.destroy === 'function') {
-              this.beiDouGridSelectedOverlay.destroy()
+            if (this.viewer?.entities) {
+              this.viewer.entities.removeById(this.beiDouGridSelectedOverlay)
             }
           } catch (e) {
             // ignore
@@ -608,14 +760,25 @@ export const useMapStore = defineStore('map', {
           const ix = parseInt(parts[2], 10)
           const iy = parseInt(parts[3], 10)
           const iz = parseInt(parts[4], 10)
-          const { zStart, dx: metaDx, dy: metaDy, dz: metaDz, originENU } = this.beiDouGridMeta
+          const {
+            zMin: zMinRel,
+            dx: metaDx,
+            dy: metaDy,
+            dz: metaDz,
+            originENU,
+            originGroundHeight,
+            groundHeights,
+            gridX: metaGridX
+          } = this.beiDouGridMeta
 
-          let lon = 0, lat = 0, height = zStart + (iz + 0.5) * metaDz
+          let lon = 0, lat = 0, height = 0
           try {
+            const colIndex = iy * metaGridX + ix
+            const groundH = groundHeights?.[colIndex] ?? originGroundHeight
             const localCenter = new Cesium.Cartesian3(
               (ix + 0.5) * metaDx,
               (iy + 0.5) * metaDy,
-              (iz + 0.5) * metaDz
+              zMinRel + (iz + 0.5) * metaDz + (groundH - originGroundHeight)
             )
             const world = Cesium.Matrix4.multiplyByPoint(originENU, localCenter, new Cesium.Cartesian3())
             const carto = Cesium.Cartographic.fromCartesian(world)
@@ -634,52 +797,56 @@ export const useMapStore = defineStore('map', {
           // instanced 模式：用单独的覆盖 Primitive 高亮选中格子（只渲染 1 个盒子）
           if (isInstanced) {
             try {
-              if (this.beiDouGridSelectedOverlay) {
-                this.viewer.scene.primitives.remove(this.beiDouGridSelectedOverlay)
-                if (typeof this.beiDouGridSelectedOverlay.destroy === 'function') {
-                  this.beiDouGridSelectedOverlay.destroy()
-                }
-              }
-
               const halfW = metaDx * 0.5
               const halfL = metaDy * 0.5
               const halfH = metaDz * 0.5
-              const overlayGeom = new Cesium.BoxOutlineGeometry({
-                minimum: new Cesium.Cartesian3(-halfW, -halfL, -halfH),
-                maximum: new Cesium.Cartesian3(halfW, halfL, halfH)
-              })
-
+              const colIndex = iy * metaGridX + ix
+              const groundH = groundHeights?.[colIndex] ?? originGroundHeight
               const localTranslation = new Cesium.Cartesian3(
                 (ix + 0.5) * metaDx,
                 (iy + 0.5) * metaDy,
-                (iz + 0.5) * metaDz
+                zMinRel + (iz + 0.5) * metaDz + (groundH - originGroundHeight)
               )
               const modelMatrix = Cesium.Matrix4.multiplyByTranslation(
                 originENU,
                 localTranslation,
                 new Cesium.Matrix4()
               )
+              // Entity box 用 position + orientation，而不是 Primitive 的 destroy/recreate
+              const worldCenter = Cesium.Matrix4.getTranslation(modelMatrix, new Cesium.Cartesian3())
+              const rot = Cesium.Matrix3.fromMatrix4(modelMatrix, new Cesium.Matrix3())
+              const orientation = Cesium.Quaternion.fromRotationMatrix(rot, new Cesium.Quaternion())
 
-              const overlayInstance = new Cesium.GeometryInstance({
-                geometry: overlayGeom,
-                modelMatrix,
-                attributes: {
-                  color: Cesium.ColorGeometryInstanceAttribute.fromColor(
-                    Cesium.Color.YELLOW.withAlpha(0.95)
-                  )
+              const overlayEntityId = 'beidou-grid-selected-overlay'
+              let overlayEntity = this.viewer.entities.getById(overlayEntityId)
+              const metaOutlineColor = this.beiDouGridMeta?.outlineColor
+              const selectedOutlineColor = Cesium.Color.RED.withAlpha(
+                Number.isFinite(metaOutlineColor?.alpha) ? metaOutlineColor.alpha : 0.95
+              )
+              if (!overlayEntity) {
+                overlayEntity = this.viewer.entities.add({
+                  id: overlayEntityId,
+                  name: '北斗格网选中高亮',
+                  position: worldCenter,
+                  orientation,
+                  box: {
+                    dimensions: new Cesium.Cartesian3(metaDx, metaDy, metaDz),
+                    fill: false,
+                    outline: true,
+                    // 选中单元边框固定红色，透明度沿用当前边框透明度设置。
+                    outlineColor: selectedOutlineColor,
+                    outlineWidth: 2
+                  }
+                })
+                this.beiDouGridSelectedOverlay = overlayEntityId
+              } else {
+                overlayEntity.position = worldCenter
+                overlayEntity.orientation = orientation
+                if (overlayEntity.box) {
+                  overlayEntity.box.dimensions = new Cesium.Cartesian3(metaDx, metaDy, metaDz)
+                  overlayEntity.box.outlineColor = selectedOutlineColor
                 }
-              })
-
-              const overlay = new Cesium.Primitive({
-                geometryInstances: overlayInstance,
-                appearance: new Cesium.PerInstanceColorAppearance({
-                  translucent: true,
-                  flat: true
-                }),
-                asynchronous: true
-              })
-              this.viewer.scene.primitives.add(overlay)
-              this.beiDouGridSelectedOverlay = overlay
+              }
             } catch (e) {
               // ignore overlay errors
               this.beiDouGridSelectedOverlay = null

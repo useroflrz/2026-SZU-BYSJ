@@ -45,9 +45,9 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
   const rawWidthM = Math.max(0, (bounds.maxLon - bounds.minLon) * metersPerDegLon)
   const rawHeightM = Math.max(0, (bounds.maxLat - bounds.minLat) * metersPerDegLat)
 
-  const gridZ = Math.max(1, Math.ceil((zMax - zMin) / dz))
-  const gridX = Math.max(1, Math.ceil(rawWidthM / dx))
-  const gridY = Math.max(1, Math.ceil(rawHeightM / dy))
+  const gridZ = options.gridZ ?? Math.max(1, Math.ceil((zMax - zMin) / dz))
+  const gridX = options.gridX ?? Math.max(1, Math.ceil(rawWidthM / dx))
+  const gridY = options.gridY ?? Math.max(1, Math.ceil(rawHeightM / dy))
   const total = gridX * gridY * gridZ
   if (!Number.isFinite(total) || total <= 0) {
     throw new Error('格网规模计算失败（请检查边界与格网尺寸）')
@@ -55,9 +55,26 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
 
   const originLon = bounds.minLon
   const originLat = bounds.minLat
-  // 以 zMin 作为 ENU 原点高度（不做贴地/地形采样）
-  const zStart = zMin
-  const originCartesian = Cesium.Cartesian3.fromDegrees(originLon, originLat, zStart)
+  // ENU 原点使用“起点地形高度”，确保后续局部 Z 偏移能映射到离地高度语义。
+  const originGroundHeight = options.originGroundHeight ?? 0
+  const groundHeights = options.groundHeights ?? null
+
+  let groundMin = originGroundHeight
+  let groundMax = originGroundHeight
+  if (groundHeights && groundHeights.length === gridX * gridY) {
+    for (let i = 0; i < groundHeights.length; i++) {
+      const h = groundHeights[i]
+      if (!Number.isFinite(h)) continue
+      if (h < groundMin) groundMin = h
+      if (h > groundMax) groundMax = h
+    }
+  } else {
+    // 若 groundHeights 不合法，则退化为“椭球高度”（groundHeights - originGroundHeight 恒为 0）
+    groundMin = originGroundHeight
+    groundMax = originGroundHeight
+  }
+
+  const originCartesian = Cesium.Cartesian3.fromDegrees(originLon, originLat, originGroundHeight)
   const originENU = Cesium.Transforms.eastNorthUpToFixedFrame(originCartesian)
 
   const halfWidth = dx * 0.5
@@ -93,8 +110,14 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
       for (let ix = 0; ix < gridX; ix++) {
         const localX = (ix + 0.5) * dx
         const localY = (iy + 0.5) * dy
-        // 单元中心高度（相对 ENU 原点 zMin）
-        const localZ = (iz + 0.5) * dz
+        // 单元中心高度（相对 ENU 原点的 Up 轴偏移）
+        // 用户输入 zMin/zMax 是“离地高度(相对 terrain)”，因此中心 Z 需要叠加 groundHeight 差值。
+        const colIndex = iy * gridX + ix
+        const groundH =
+          groundHeights && groundHeights.length === gridX * gridY
+            ? groundHeights[colIndex]
+            : originGroundHeight
+        const localZ = zMin + (iz + 0.5) * dz + (groundH - originGroundHeight)
         Cesium.Matrix4.fromTranslation(
           new Cesium.Cartesian3(localX, localY, localZ),
           scratchTranslation
@@ -116,10 +139,12 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
     })
   }
 
+  const centerGroundHeight = (groundMin + groundMax) * 0.5
   const localCenter = new Cesium.Cartesian3(
     gridX * dx * 0.5,
     gridY * dy * 0.5,
-    (gridZ * dz) * 0.5
+    // zMin: 离地基准；(groundMax/Min) 用于近似覆盖贴地起伏
+    zMin + (gridZ * dz) * 0.5 + (centerGroundHeight - originGroundHeight)
   )
   const worldCenter = Cesium.Matrix4.multiplyByPoint(
     originENU,
@@ -127,7 +152,10 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
     new Cesium.Cartesian3()
   )
   const halfDiag = Math.sqrt(
-    (gridX * dx) ** 2 + (gridY * dy) ** 2 + (gridZ * dz) ** 2
+    (gridX * dx) ** 2 +
+      (gridY * dy) ** 2 +
+      // 考虑地形起伏：z 总范围 = 网格高度 + groundHeight(最大-最小)
+      ((gridZ * dz + (groundMax - groundMin)) ** 2)
   ) * 0.5
   const boundingSphere = new Cesium.BoundingSphere(worldCenter, halfDiag)
 
@@ -148,17 +176,37 @@ attribute vec4 instanceMatrix0;
 attribute vec4 instanceMatrix1;
 attribute vec4 instanceMatrix2;
 attribute vec4 instanceMatrix3;
+varying vec3 v_localPos;
 void main() {
   mat4 instanceMatrix = mat4(instanceMatrix0, instanceMatrix1, instanceMatrix2, instanceMatrix3);
+  v_localPos = position;
   gl_Position = czm_viewProjection * instanceMatrix * vec4(position, 1.0);
 }
 `
 
 const FS_SOURCE = `
 precision mediump float;
-uniform vec4 u_color;
+uniform vec4 u_fillColor;
+uniform vec4 u_outlineColor;
+uniform vec3 u_halfSize;
+uniform float u_wireframeShow;
+uniform float u_wireframeEdgeRatio;
+varying vec3 v_localPos;
+
+float edgeMaskFromLocalPos(vec3 localPos, vec3 halfSize, float edgeRatio) {
+  vec3 safeHalf = max(halfSize, vec3(0.0001));
+  vec3 n = abs(localPos) / safeHalf;
+  vec3 nearEdge = step(vec3(1.0 - edgeRatio), n);
+  float edgeOnXFace = nearEdge.x * max(nearEdge.y, nearEdge.z);
+  float edgeOnYFace = nearEdge.y * max(nearEdge.x, nearEdge.z);
+  float edgeOnZFace = nearEdge.z * max(nearEdge.x, nearEdge.y);
+  return clamp(max(edgeOnXFace, max(edgeOnYFace, edgeOnZFace)), 0.0, 1.0);
+}
+
 void main() {
-  gl_FragColor = u_color;
+  float edgeMask = edgeMaskFromLocalPos(v_localPos, u_halfSize, u_wireframeEdgeRatio) * u_wireframeShow;
+  vec4 mixedColor = mix(u_fillColor, u_outlineColor, edgeMask);
+  gl_FragColor = mixedColor;
 }
 `
 
@@ -290,6 +338,16 @@ export class BeiDouGridPrimitive {
 
   get ready() {
     return this._ready
+  }
+
+  setWireframeStyle(style = {}) {
+    if (!this._wireframe) this._wireframe = {}
+    if (style.color instanceof Cesium.Color) this._wireframe.color = style.color
+    if (style.fillColor instanceof Cesium.Color) this._wireframe.fillColor = style.fillColor
+    if (typeof style.show === 'boolean') this._wireframe.show = style.show
+    if (Number.isFinite(style.edgeRatio)) {
+      this._wireframe.edgeRatio = Cesium.Math.clamp(style.edgeRatio, 0.005, 0.2)
+    }
   }
 
   _ensureBoundingSphere() {
@@ -514,14 +572,37 @@ export class BeiDouGridPrimitive {
     })
 
     const wireframe = this._wireframe || {}
-    const color =
+    const fillColor =
+      wireframe.fillColor instanceof Cesium.Color
+        ? wireframe.fillColor
+        : new Cesium.Color(0.0, 0.9, 1.0, 0.25)
+    const outlineColor =
       wireframe.color instanceof Cesium.Color
         ? wireframe.color
-        : new Cesium.Color(0.0, 0.9, 1.0, 0.25)
+        : Cesium.Color.BLACK.withAlpha(0.7)
+    const halfSize = wireframe.halfSize instanceof Cesium.Cartesian3
+      ? wireframe.halfSize
+      : new Cesium.Cartesian3(50.0, 50.0, 25.0)
+    const edgeRatio = Number.isFinite(wireframe.edgeRatio)
+      ? Cesium.Math.clamp(wireframe.edgeRatio, 0.005, 0.2)
+      : 0.04
 
     const uniformMap = {
-      u_color: function () {
-        return color
+      u_fillColor: () => {
+        return this._wireframe?.fillColor || fillColor
+      },
+      u_outlineColor: () => {
+        return this._wireframe?.color || outlineColor
+      },
+      u_halfSize: () => {
+        return this._wireframe?.halfSize || halfSize
+      },
+      u_wireframeShow: () => {
+        return this._wireframe?.show === false ? 0.0 : 1.0
+      },
+      u_wireframeEdgeRatio: () => {
+        const ratio = this._wireframe?.edgeRatio
+        return Number.isFinite(ratio) ? Cesium.Math.clamp(ratio, 0.005, 0.2) : edgeRatio
       }
     }
 

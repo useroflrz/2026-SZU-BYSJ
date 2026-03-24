@@ -197,7 +197,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, toRaw } from 'vue'
 import { Upload } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import * as Cesium from 'cesium'
@@ -271,7 +271,8 @@ const generateGridPointsInBounds = (bounds, spacingM) => {
 
 const sampleHeights = async (viewer, lonLatPoints) => {
   if (!viewer || lonLatPoints.length === 0) return []
-  const terrain = viewer.terrainProvider
+  const rawViewer = toRaw(viewer)
+  const terrain = rawViewer?.terrainProvider
   const out = []
   const BATCH = 200
   // 地形 provider 可能未就绪或 token/网络导致内部可用性信息缺失，这里做容错：

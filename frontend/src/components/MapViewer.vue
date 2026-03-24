@@ -78,12 +78,19 @@ onMounted(async () => {
   try {
     const tp = viewer.terrainProvider
     if (tp && tp.errorEvent && typeof tp.errorEvent.addEventListener === 'function') {
+      // 重要：地形瓦片失败并不一定意味着“整个地形不可用”
+      // （例如格网贴地会触发额外采样请求，可能只失败少量瓦片）。
+      // 若每次失败都直接切换到 EllipsoidTerrainProvider，会导致底图起伏瞬间消失。
+      // 另外：不要在渲染过程中动态切换 terrainProvider（会导致 Cesium 内部 tile 状态不一致，
+      // 从而出现你提到的 `reading 'rectangles'` 这类渲染停止错误）。
+      // 这里仅做日志限流，不进行运行时 provider 切换。
+      let terrainErrorCount = 0
+      const LOG_FIRST_N = 5
+
       tp.errorEvent.addEventListener((err) => {
-        console.warn('地形瓦片请求失败，回退到椭球地形：', err)
-        try {
-          viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider()
-        } catch (e) {
-          // ignore
+        terrainErrorCount += 1
+        if (terrainErrorCount <= LOG_FIRST_N) {
+          console.warn('地形瓦片请求失败（保留当前地形底图），错误：', err)
         }
       })
     }
@@ -102,25 +109,30 @@ onMounted(async () => {
   // 鼠标拾取北斗格网单元（geometryInstances 走 Cesium pick，instanced 走 GPU 拾取）
   clickHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas)
   clickHandler.setInputAction((movement) => {
-    let id = null
-    const picked = viewer.scene.pick(movement.position)
-    if (picked && picked.id) id = picked.id
-    if ((typeof id !== 'string' || !id.startsWith('beidou-cell-')) && mapStore.beiDouGridMeta?.renderMode === 'instanced' && mapStore.beiDouGridPrimitive?.pick) {
-      const globalId = mapStore.beiDouGridPrimitive.pick(viewer.scene, movement.position.x, movement.position.y)
-      if (globalId >= 0 && mapStore.beiDouGridMeta) {
-        const { gridX, gridY, gridZ } = mapStore.beiDouGridMeta
-        const layerSize = gridX * gridY
-        const iz = Math.floor(globalId / layerSize)
-        const rem = globalId % layerSize
-        const iy = Math.floor(rem / gridX)
-        const ix = rem % gridX
-        id = `beidou-cell-${ix}-${iy}-${iz}`
+    try {
+      let id = null
+      const picked = viewer.scene.pick(movement.position)
+      if (picked && picked.id) id = picked.id
+      if ((typeof id !== 'string' || !id.startsWith('beidou-cell-')) && mapStore.beiDouGridMeta?.renderMode === 'instanced' && mapStore.beiDouGridPrimitive?.pick) {
+        const globalId = mapStore.beiDouGridPrimitive.pick(viewer.scene, movement.position.x, movement.position.y)
+        if (globalId >= 0 && mapStore.beiDouGridMeta) {
+          const { gridX, gridY } = mapStore.beiDouGridMeta
+          const layerSize = gridX * gridY
+          const iz = Math.floor(globalId / layerSize)
+          const rem = globalId % layerSize
+          const iy = Math.floor(rem / gridX)
+          const ix = rem % gridX
+          id = `beidou-cell-${ix}-${iy}-${iz}`
+        }
       }
-    }
-    if (typeof id === 'string' && id.startsWith('beidou-cell-')) {
-      mapStore.selectBeiDouCell(id)
-    } else {
-      mapStore.selectBeiDouCell(null)
+      if (typeof id === 'string' && id.startsWith('beidou-cell-')) {
+        mapStore.selectBeiDouCell(id)
+      } else {
+        mapStore.selectBeiDouCell(null)
+      }
+    } catch (e) {
+      // 防止 Cesium 内部对象销毁竞态导致未捕获异常
+      console.warn('[MapViewer] click pick/select failed:', e)
     }
   }, Cesium.ScreenSpaceEventType.LEFT_CLICK)
 
