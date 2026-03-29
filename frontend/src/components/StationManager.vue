@@ -8,40 +8,8 @@
         </el-radio-group>
       </el-form-item>
 
-      <!-- 自动选点 -->
+      <!-- 自动选点：区域内均匀 10 点 + 在线地形高程 -->
       <template v-if="addMode === 'auto'">
-        <el-form-item label="候选点间距(米)">
-          <el-input-number
-            v-model="autoForm.candidateSpacing"
-            :min="50"
-            :step="50"
-            style="width: 100%"
-          />
-        </el-form-item>
-        <el-form-item label="覆盖采样间距(米)">
-          <el-input-number
-            v-model="autoForm.demandSpacing"
-            :min="50"
-            :step="50"
-            style="width: 100%"
-          />
-        </el-form-item>
-        <el-form-item label="覆盖半径(米)">
-          <el-input-number
-            v-model="autoForm.coverRadius"
-            :min="100"
-            :step="100"
-            style="width: 100%"
-          />
-        </el-form-item>
-        <el-form-item label="最大站点数">
-          <el-input-number
-            v-model="autoForm.maxStations"
-            :min="1"
-            :step="1"
-            style="width: 100%"
-          />
-        </el-form-item>
         <el-form-item label="频段(GHz)">
           <el-input-number
             v-model="autoForm.frequency"
@@ -218,11 +186,11 @@ const editingStation = ref(null)
 const isAutoPicking = ref(false)
 const autoSummary = ref('')
 
+const AUTO_STATION_COUNT = 10
+/** 天线相对地面高度（米），与 map.setStations 的 RELATIVE_TO_GROUND 一致 */
+const DEFAULT_STATION_AGL_M = 30
+
 const autoForm = ref({
-  candidateSpacing: 200,
-  demandSpacing: 200,
-  coverRadius: 2000,
-  maxStations: 10,
   frequency: 2.4,
   type: 'base'
 })
@@ -256,14 +224,46 @@ const degToMetersFactors = (minLat, maxLat) => {
   return { metersPerDegLat, metersPerDegLon }
 }
 
-const generateGridPointsInBounds = (bounds, spacingM) => {
+/**
+ * 在经纬度矩形内生成均匀网格中心点（固定 count 个，默认 10）。
+ * 横长区域用 5×2（沿经度 5 格），竖长区域用 2×5。
+ */
+const generateUniformPointsInBounds = (bounds, count = AUTO_STATION_COUNT) => {
+  const { minLon, minLat, maxLon, maxLat } = bounds
+  const dLon = maxLon - minLon
+  const dLat = maxLat - minLat
   const { metersPerDegLat, metersPerDegLon } = degToMetersFactors(bounds.minLat, bounds.maxLat)
-  const lonStep = spacingM / Math.max(1e-9, metersPerDegLon)
-  const latStep = spacingM / metersPerDegLat
+  const widthM = Math.max(0, dLon * metersPerDegLon)
+  const heightM = Math.max(0, dLat * metersPerDegLat)
+
+  let rows = 2
+  let cols = 5
+  if (count === 10) {
+    if (widthM < heightM) {
+      rows = 5
+      cols = 2
+    }
+  } else {
+    let best = { rows: 1, cols: count, score: Infinity }
+    for (let c = 1; c <= count; c++) {
+      if (count % c !== 0) continue
+      const r = count / c
+      const cellAspect = (widthM / c) / Math.max(heightM / r, 1e-9)
+      const regionAspect = widthM / Math.max(heightM, 1e-9)
+      const score = Math.abs(Math.log(cellAspect + 1e-12) - Math.log(regionAspect + 1e-12))
+      if (score < best.score) best = { rows: r, cols: c, score }
+    }
+    rows = best.rows
+    cols = best.cols
+  }
+
   const pts = []
-  for (let lon = bounds.minLon; lon <= bounds.maxLon; lon += lonStep) {
-    for (let lat = bounds.minLat; lat <= bounds.maxLat; lat += latStep) {
-      pts.push({ lon, lat })
+  for (let iy = 0; iy < rows; iy++) {
+    for (let ix = 0; ix < cols; ix++) {
+      pts.push({
+        lon: minLon + (ix + 0.5) * dLon / cols,
+        lat: minLat + (iy + 0.5) * dLat / rows
+      })
     }
   }
   return pts
@@ -312,12 +312,6 @@ const sampleHeights = async (viewer, lonLatPoints) => {
   return out
 }
 
-const distanceMetersApprox = (a, b, metersPerDegLon, metersPerDegLat) => {
-  const dx = (a.lon - b.lon) * metersPerDegLon
-  const dy = (a.lat - b.lat) * metersPerDegLat
-  return Math.sqrt(dx * dx + dy * dy)
-}
-
 const autoSelectStations = async () => {
   if (!canAutoPick.value) {
     ElMessage.warning('请先在“区域选择”中确认区域，并确保地图已加载')
@@ -329,127 +323,47 @@ const autoSelectStations = async () => {
     return
   }
 
-  const {
-    candidateSpacing,
-    demandSpacing,
-    coverRadius,
-    maxStations,
-    frequency,
-    type
-  } = autoForm.value
-
-  if (candidateSpacing <= 0 || demandSpacing <= 0 || coverRadius <= 0 || maxStations <= 0) {
-    ElMessage.warning('自动选点参数不合法')
-    return
-  }
+  const { frequency, type } = autoForm.value
 
   isAutoPicking.value = true
   autoSummary.value = ''
   try {
-    const { metersPerDegLat, metersPerDegLon } = degToMetersFactors(bounds.minLat, bounds.maxLat)
-
-    // 需求点：用于“覆盖完全”的近似判定（规则采样点）
-    const demand = generateGridPointsInBounds(bounds, demandSpacing)
-    if (demand.length === 0) {
-      ElMessage.warning('区域过小或采样间距过大，无法生成覆盖采样点')
+    const uniformLonLat = generateUniformPointsInBounds(bounds, AUTO_STATION_COUNT)
+    if (uniformLonLat.length === 0) {
+      ElMessage.warning('无法生成均匀分布点')
       return
     }
 
-    // 候选点：用于选站点（也用规则采样）
-    const candidatesLonLat = generateGridPointsInBounds(bounds, candidateSpacing)
-    if (candidatesLonLat.length === 0) {
-      ElMessage.warning('区域过小或候选点间距过大，无法生成候选点')
-      return
-    }
+    ElMessage.info(`在区域内均匀生成 ${uniformLonLat.length} 个点，正在采样在线地形高程...`)
+    const withHeight = await sampleHeights(mapStore.viewer, uniformLonLat)
 
-    ElMessage.info(`候选点 ${candidatesLonLat.length}，覆盖采样点 ${demand.length}，正在采样高程...`)
-    const candidatesWithHeight = await sampleHeights(mapStore.viewer, candidatesLonLat)
-
-    // 预计算每个候选点覆盖的需求点索引（近似平面距离）
-    const coverSets = candidatesWithHeight.map((c) => {
-      const covered = []
-      for (let di = 0; di < demand.length; di++) {
-        const d = demand[di]
-        const dist = distanceMetersApprox(c, d, metersPerDegLon, metersPerDegLat)
-        if (dist <= coverRadius) covered.push(di)
-      }
-      return covered
-    })
-
-    const uncovered = new Array(demand.length).fill(true)
-    let uncoveredCount = demand.length
-
-    const selected = []
-    const used = new Array(candidatesWithHeight.length).fill(false)
-
-    const countNewCoverage = (coverIdxs) => {
-      let cnt = 0
-      for (let i = 0; i < coverIdxs.length; i++) {
-        if (uncovered[coverIdxs[i]]) cnt++
-      }
-      return cnt
-    }
-
-    for (let k = 0; k < maxStations; k++) {
-      let bestIdx = -1
-      let bestGain = 0
-      let bestHeight = -Infinity
-
-      for (let ci = 0; ci < candidatesWithHeight.length; ci++) {
-        if (used[ci]) continue
-        const gain = countNewCoverage(coverSets[ci])
-        if (gain > bestGain) {
-          bestGain = gain
-          bestIdx = ci
-          bestHeight = candidatesWithHeight[ci].groundHeight
-        } else if (gain === bestGain && gain > 0) {
-          // 覆盖增益相同，优先选更高的点
-          const h = candidatesWithHeight[ci].groundHeight
-          if (h > bestHeight) {
-            bestIdx = ci
-            bestHeight = h
-          }
-        }
-      }
-
-      if (bestIdx === -1 || bestGain === 0) break
-
-      used[bestIdx] = true
-      const chosen = candidatesWithHeight[bestIdx]
-      const coverIdxs = coverSets[bestIdx]
-      for (let i = 0; i < coverIdxs.length; i++) {
-        const di = coverIdxs[i]
-        if (uncovered[di]) {
-          uncovered[di] = false
-          uncoveredCount--
-        }
-      }
-
-      selected.push({
+    const agl = DEFAULT_STATION_AGL_M
+    const selected = withHeight.map((pt, k) => {
+      const gh = pt.groundHeight
+      return {
         id: `auto-${Date.now()}-${k}`,
         name: `站点${k + 1}`,
         position: {
-          lon: chosen.lon,
-          lat: chosen.lat,
-          height: 30 // 相对地面高度：给一个固定天线高度（简单起见）
+          lon: pt.lon,
+          lat: pt.lat,
+          height: agl
         },
         frequency,
         type,
         meta: {
-          groundHeight: chosen.groundHeight,
-          coverGain: bestGain
+          groundHeight: gh,
+          absoluteHeight: gh + agl
         }
-      })
-
-      if (uncoveredCount === 0) break
-    }
+      }
+    })
 
     analysisStore.setStations(selected)
     mapStore.setStations(selected)
 
-    const covered = demand.length - uncoveredCount
-    const coverageRatio = demand.length === 0 ? 0 : covered / demand.length
-    autoSummary.value = `已生成 ${selected.length} 个站点，覆盖采样点 ${covered.toLocaleString()} / ${demand.length.toLocaleString()}（${(coverageRatio * 100).toFixed(2)}%）`
+    const ghMin = Math.min(...selected.map((s) => s.meta.groundHeight))
+    const ghMax = Math.max(...selected.map((s) => s.meta.groundHeight))
+    autoSummary.value =
+      `已生成 ${selected.length} 个均匀分布站点；在线地形椭球高程约 ${ghMin.toFixed(1)}～${ghMax.toFixed(1)} m（天线离地 ${agl} m，绝对海拔见各站点 meta.absoluteHeight）`
     ElMessage.success('自动选点完成，站点已渲染到地图')
   } catch (e) {
     ElMessage.error(`自动选点失败：${e?.message || '未知错误'}`)
