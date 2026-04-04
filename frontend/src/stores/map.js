@@ -712,6 +712,7 @@ export const useMapStore = defineStore('map', {
               color: baseOutlineColor,
               halfSize: new Cesium.Cartesian3(halfWidth, halfLength, halfHeight),
               edgeRatio: 0.01,
+              lineWidthPx: 1.25,
               visibleDistance: 1e9
             },
             debug: import.meta.env?.DEV

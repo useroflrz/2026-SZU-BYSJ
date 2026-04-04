@@ -209,13 +209,20 @@ void main() {
 }
 `
 
+// 线框：优先「盒体 + 片元 fwidth」实现近似像素恒定线宽（无额外线段几何，适合百万实例）。
+// 备选为物体空间 edgeRatio（无 OES_standard_derivatives / 非 WEBGL_2 时回退）。
+// 显式线段 + NDC 扩展（每盒 12 边）几何量约为当前方案的十余倍，未采用。
 const FS_SOURCE = `
+#ifdef GL_OES_standard_derivatives
+#extension GL_OES_standard_derivatives : enable
+#endif
 precision mediump float;
 uniform vec4 u_fillColor;
 uniform vec4 u_outlineColor;
 uniform vec3 u_halfSize;
 uniform float u_wireframeShow;
 uniform float u_wireframeEdgeRatio;
+uniform float u_lineWidthPx;
 varying vec3 v_localPos;
 varying float v_instanceVisible;
 
@@ -229,9 +236,36 @@ float edgeMaskFromLocalPos(vec3 localPos, vec3 halfSize, float edgeRatio) {
   return clamp(max(edgeOnXFace, max(edgeOnYFace, edgeOnZFace)), 0.0, 1.0);
 }
 
+#if defined(WEBGL_2) || defined(GL_OES_standard_derivatives)
+float edgeMaskScreenSpace(vec3 localPos, vec3 halfSize, float lineWidthPx) {
+  vec3 safeHalf = max(halfSize, vec3(0.0001));
+  vec3 ax = abs(localPos);
+  vec3 n = ax / safeHalf;
+  float distRim;
+  if (n.x >= n.y && n.x >= n.z) {
+    distRim = min(safeHalf.y - ax.y, safeHalf.z - ax.z);
+  } else if (n.y >= n.x && n.y >= n.z) {
+    distRim = min(safeHalf.x - ax.x, safeHalf.z - ax.z);
+  } else {
+    distRim = min(safeHalf.x - ax.x, safeHalf.y - ax.y);
+  }
+  distRim = max(distRim, 0.0);
+  float dw = fwidth(distRim);
+  dw = max(dw, 1e-6);
+  float pxDist = distRim / dw;
+  float halfW = lineWidthPx * 0.5;
+  return clamp(1.0 - smoothstep(halfW - 0.5, halfW + 1.0, pxDist), 0.0, 1.0);
+}
+#endif
+
 void main() {
   if (v_instanceVisible < 0.5) discard;
-  float edgeMask = edgeMaskFromLocalPos(v_localPos, u_halfSize, u_wireframeEdgeRatio) * u_wireframeShow;
+  float edgeMask;
+#if defined(WEBGL_2) || defined(GL_OES_standard_derivatives)
+  edgeMask = edgeMaskScreenSpace(v_localPos, u_halfSize, u_lineWidthPx) * u_wireframeShow;
+#else
+  edgeMask = edgeMaskFromLocalPos(v_localPos, u_halfSize, u_wireframeEdgeRatio) * u_wireframeShow;
+#endif
   vec4 mixedColor = mix(u_fillColor, u_outlineColor, edgeMask);
   gl_FragColor = mixedColor;
 }
@@ -376,6 +410,9 @@ export class BeiDouGridPrimitive {
     if (typeof style.show === 'boolean') this._wireframe.show = style.show
     if (Number.isFinite(style.edgeRatio)) {
       this._wireframe.edgeRatio = Cesium.Math.clamp(style.edgeRatio, 0.005, 0.2)
+    }
+    if (Number.isFinite(style.lineWidthPx)) {
+      this._wireframe.lineWidthPx = Cesium.Math.clamp(style.lineWidthPx, 0.5, 8.0)
     }
   }
 
@@ -616,6 +653,9 @@ export class BeiDouGridPrimitive {
     const edgeRatio = Number.isFinite(wireframe.edgeRatio)
       ? Cesium.Math.clamp(wireframe.edgeRatio, 0.005, 0.2)
       : 0.04
+    const lineWidthPxDefault = Number.isFinite(wireframe.lineWidthPx)
+      ? Cesium.Math.clamp(wireframe.lineWidthPx, 0.5, 8.0)
+      : 1.25
 
     const uniformMap = {
       u_fillColor: () => {
@@ -633,6 +673,10 @@ export class BeiDouGridPrimitive {
       u_wireframeEdgeRatio: () => {
         const ratio = this._wireframe?.edgeRatio
         return Number.isFinite(ratio) ? Cesium.Math.clamp(ratio, 0.005, 0.2) : edgeRatio
+      },
+      u_lineWidthPx: () => {
+        const w = this._wireframe?.lineWidthPx
+        return Number.isFinite(w) ? Cesium.Math.clamp(w, 0.5, 8.0) : lineWidthPxDefault
       }
     }
 
