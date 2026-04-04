@@ -90,7 +90,6 @@ async function sampleGridGroundHeights(viewer, normalizedBounds, originLon, orig
 const defaultLayerState = () => ({
   regionEntityId: null,
   stationEntityIds: [],
-  gridEntityIds: [],
   resultEntityIds: []
 })
 
@@ -106,7 +105,12 @@ export const useMapStore = defineStore('map', {
     beiDouGridPrimitive: null,
     beiDouGridOutlinePrimitive: null,
     beiDouGridInstancedPrimitives: [],
+    beiDouGridResultPrimitive: null,
+    beiDouGridResultOutlinePrimitive: null,
+    beiDouGridResultInstancedPrimitives: [],
     beiDouGridMeta: null,
+    // 后端分析后的紧凑结果快照（用于结果导出/复位）
+    beiDouLastCompactResult: null,
     // instanced 模式下的选中格子高亮：使用官方 Primitive + GeometryInstance
     beiDouGridSelectedPrimitive: null,
     selectedBeiDouCellId: null,
@@ -115,7 +119,18 @@ export const useMapStore = defineStore('map', {
 
   getters: {
     hasViewer: (state) => state.viewer !== null,
-    layerCount: (state) => state.layers.length
+    layerCount: (state) => state.layers.length,
+    /** 分析结果层在时优先用结果 Primitive，否则用格网生成层（便于拾取/选中） */
+    activeBeiDouCellPrimitive: (state) => {
+      const r = state.beiDouGridResultPrimitive
+      if (r != null && r.show !== false) return r
+      return state.beiDouGridPrimitive
+    },
+    activeBeiDouCellOutlinePrimitive: (state) => {
+      const r = state.beiDouGridResultPrimitive
+      if (r != null && r.show !== false) return state.beiDouGridResultOutlinePrimitive
+      return state.beiDouGridOutlinePrimitive
+    }
   },
 
   actions: {
@@ -125,6 +140,10 @@ export const useMapStore = defineStore('map', {
         const isDestroyed =
           typeof primitive.isDestroyed === 'function' ? primitive.isDestroyed() : false
         if (isDestroyed) return
+
+        // Cesium 官方 Primitive 的生命周期交给 PrimitiveCollection 管理，
+        // remove() 后再手动 destroy() 容易触发渲染帧中的 destroyed 引用错误。
+        if (primitive instanceof Cesium.Primitive) return
 
         const doDestroy = () => {
           try {
@@ -183,13 +202,11 @@ export const useMapStore = defineStore('map', {
     clearAllEntities() {
       if (!this.viewer) return
       this.layerState.stationEntityIds.forEach(id => this.viewer.entities.removeById(id))
-      this.layerState.gridEntityIds.forEach(id => this.viewer.entities.removeById(id))
       this.layerState.resultEntityIds.forEach(id => this.viewer.entities.removeById(id))
       if (this.layerState.regionEntityId) {
         this.viewer.entities.removeById(this.layerState.regionEntityId)
       }
       this.layerState = defaultLayerState()
-      // 同时清除北斗格网 Primitive
       this.clearBeiDouGrid()
     },
 
@@ -279,7 +296,7 @@ export const useMapStore = defineStore('map', {
           ),
           billboard: {
             image: 'https://unpkg.com/ionicons@5.5.2/dist/svg/radio-outline.svg',
-            scale: 0.8,
+            scale: 0.5,
             color: Cesium.Color.fromCssColorString('#409EFF'),
             heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND
           },
@@ -298,23 +315,6 @@ export const useMapStore = defineStore('map', {
       })
     },
 
-    setGridPoints(points) {
-      if (!this.viewer) return
-      this.layerState.gridEntityIds.forEach(id => this.viewer.entities.removeById(id))
-      this.layerState.gridEntityIds = []
-
-      points.forEach(pt => {
-        const entity = this.viewer.entities.add({
-          position: Cesium.Cartesian3.fromDegrees(pt.lon, pt.lat, pt.height || 0),
-          point: {
-            pixelSize: 4,
-            color: Cesium.Color.fromCssColorString('#67C23A').withAlpha(0.8)
-          }
-        })
-        this.layerState.gridEntityIds.push(entity.id)
-      })
-    },
-
     setResultPoints(points, options = {}) {
       if (!this.viewer) return
       const { colorScheme = 'green_red', pointSize = 4, filterHeightRange = null } = options
@@ -322,6 +322,11 @@ export const useMapStore = defineStore('map', {
       this.layerState.resultEntityIds = []
 
       const colorByScheme = (visible) => {
+        if (colorScheme === 'uncovered') {
+          return visible
+            ? Cesium.Color.fromCssColorString('#67C23A').withAlpha(0.08)
+            : Cesium.Color.fromCssColorString('#F56C6C').withAlpha(0.95)
+        }
         if (colorScheme === 'blue_gray') {
           return visible
             ? Cesium.Color.fromCssColorString('#409EFF').withAlpha(0.9)
@@ -361,17 +366,106 @@ export const useMapStore = defineStore('map', {
       })
     },
 
+    clearBeiDouResultGrid() {
+      if (!this.viewer) return
+      const removePrimitiveSafe = (primitive) => {
+        if (!primitive) return
+        try {
+          const inScene = this.viewer.scene?.primitives?.contains?.(primitive) === true
+          if (inScene) {
+            this.viewer.scene.primitives.remove(primitive)
+            return
+          }
+          if (typeof primitive.isDestroyed === 'function' && !primitive.isDestroyed()) {
+            this.schedulePrimitiveDestroy(primitive)
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      removePrimitiveSafe(this.beiDouGridResultPrimitive)
+      removePrimitiveSafe(this.beiDouGridResultOutlinePrimitive)
+      if (Array.isArray(this.beiDouGridResultInstancedPrimitives)) {
+        this.beiDouGridResultInstancedPrimitives.forEach((p) => removePrimitiveSafe(p))
+      }
+      this.beiDouGridResultPrimitive = null
+      this.beiDouGridResultOutlinePrimitive = null
+      this.beiDouGridResultInstancedPrimitives = []
+    },
+
+    async restoreBeiDouBaseGrid() {
+      if (!this.viewer || !this.beiDouGridMeta) return
+      this.beiDouLastCompactResult = null
+      this.clearBeiDouResultGrid()
+      if (this.beiDouGridPrimitive) this.beiDouGridPrimitive.show = true
+      if (this.beiDouGridOutlinePrimitive) this.beiDouGridOutlinePrimitive.show = true
+      if (Array.isArray(this.beiDouGridInstancedPrimitives)) {
+        this.beiDouGridInstancedPrimitives.forEach((p) => {
+          if (p) p.show = true
+        })
+      }
+      if (this.viewer?.scene?.requestRender) this.viewer.scene.requestRender()
+    },
+
+    async renderBeiDouUncoveredGridFromCompactResult(compactResult) {
+      if (!this.viewer || !this.beiDouGridMeta) return
+      const isCompactResult = compactResult?.type === 'gridViewshedCompact'
+      if (!isCompactResult) return
+
+      const meta = this.beiDouGridMeta
+      const uncoveredIndicesRaw = Array.isArray(compactResult.uncoveredIndices)
+        ? compactResult.uncoveredIndices
+        : []
+      const totalCells = meta.gridX * meta.gridY * meta.gridZ
+      const hiddenSet = new Set()
+      const uncoveredIndices = []
+      for (let i = 0; i < uncoveredIndicesRaw.length; i++) {
+        const idx = uncoveredIndicesRaw[i]
+        if (!Number.isFinite(idx) || idx < 0 || idx >= totalCells || hiddenSet.has(idx)) continue
+        hiddenSet.add(idx)
+        uncoveredIndices.push(idx)
+      }
+
+      this.beiDouLastCompactResult = compactResult
+
+      const uncoveredColor = Cesium.Color.fromCssColorString('#F56C6C').withAlpha(0.95)
+      const hiddenIndices = []
+      for (let idx = 0; idx < totalCells; idx++) {
+        if (!hiddenSet.has(idx)) hiddenIndices.push(idx)
+      }
+
+      // 隐藏“格网生成”的蓝色本体，仅显示结果层
+      if (this.beiDouGridPrimitive) this.beiDouGridPrimitive.show = false
+      if (this.beiDouGridOutlinePrimitive) this.beiDouGridOutlinePrimitive.show = false
+      if (Array.isArray(this.beiDouGridInstancedPrimitives)) {
+        this.beiDouGridInstancedPrimitives.forEach((p) => {
+          if (p) p.show = false
+        })
+      }
+
+      const renderInfo = await this.showBeiDouGrid(meta.bounds, {
+        dx: meta.dx,
+        dy: meta.dy,
+        dz: meta.dz,
+        zMin: meta.zMin,
+        zMax: meta.zMax,
+        fillColor: '#F56C6C',
+        fillOpacity: 0.95,
+        outlineColor: '#F56C6C',
+        outlineOpacity: Number.isFinite(meta.baseOutlineColor?.alpha) ? meta.baseOutlineColor.alpha : 0.95,
+        hiddenInstanceIndices: hiddenIndices,
+        appendMode: true,
+        saveAsResultLayer: true
+      })
+      if (!renderInfo) return
+
+      if (this.viewer?.scene?.requestRender) this.viewer.scene.requestRender()
+    },
+
     setStationLayerVisibility(show) {
       if (!this.viewer) return
       this.layerState.stationEntityIds.forEach(id => {
-        const entity = this.viewer.entities.getById(id)
-        if (entity) entity.show = show
-      })
-    },
-
-    setGridLayerVisibility(show) {
-      if (!this.viewer) return
-      this.layerState.gridEntityIds.forEach(id => {
         const entity = this.viewer.entities.getById(id)
         if (entity) entity.show = show
       })
@@ -386,7 +480,13 @@ export const useMapStore = defineStore('map', {
         return null
       }
 
-      this.clearBeiDouGrid()
+      const appendMode = gridParams?.appendMode === true
+      const saveAsResultLayer = gridParams?.saveAsResultLayer === true
+      if (!appendMode) {
+        this.clearBeiDouGrid()
+      } else {
+        this.clearBeiDouResultGrid()
+      }
 
       // bounds 兼容：可能是 minX/minY/maxX/maxY
       const b = bounds || {}
@@ -409,7 +509,8 @@ export const useMapStore = defineStore('map', {
         fillColor,
         fillOpacity,
         outlineColor,
-        outlineOpacity
+        outlineOpacity,
+        hiddenInstanceIndices
       } = gridParams
 
       const __debugBeiDou = !!import.meta.env?.DEV
@@ -435,6 +536,18 @@ export const useMapStore = defineStore('map', {
       const useInstancing = total > MAX_GEOMETRY_INSTANCES
       let renderedCount = 0
       const capped = false
+      const hiddenFlags =
+        Array.isArray(hiddenInstanceIndices) && hiddenInstanceIndices.length > 0
+          ? (() => {
+              const flags = new Uint8Array(total)
+              for (let i = 0; i < hiddenInstanceIndices.length; i++) {
+                const idx = hiddenInstanceIndices[i]
+                if (!Number.isFinite(idx) || idx < 0 || idx >= total) continue
+                flags[idx] = 1
+              }
+              return flags
+            })()
+          : null
 
       if (__debugBeiDou) {
         console.log('🧮 Grid Derived:', { gridX, gridY, gridZ, total, useInstancing })
@@ -471,14 +584,14 @@ export const useMapStore = defineStore('map', {
         ? Cesium.Color.fromCssColorString(fillColor)
         : new Cesium.Color(0.0, 0.9, 1.0, 1.0)
       ).withAlpha(
-        typeof fillOpacity === 'number' ? fillOpacity : 0.25
+        typeof fillOpacity === 'number' ? fillOpacity : 0.05
       )
 
       const baseOutlineColor = (outlineColor
         ? Cesium.Color.fromCssColorString(outlineColor)
         : Cesium.Color.BLACK
       ).withAlpha(
-        typeof outlineOpacity === 'number' ? outlineOpacity : 0.8
+        typeof outlineOpacity === 'number' ? outlineOpacity : 0.95
       )
 
       if (!useInstancing) {
@@ -500,6 +613,8 @@ export const useMapStore = defineStore('map', {
             const colIndex = iy * gridX + ix
             const groundH = groundHeights?.[colIndex] ?? originGroundHeight
             for (let iz = 0; iz < gridZ; iz++) {
+              const instanceIndex = iz * gridX * gridY + iy * gridX + ix
+              if (hiddenFlags && hiddenFlags[instanceIndex] === 1) continue
               const centerZRel = zMinRel + (iz + 0.5) * dz + (groundH - originGroundHeight)
               const localTranslation = new Cesium.Cartesian3(
                 (ix + 0.5) * dx,
@@ -547,7 +662,8 @@ export const useMapStore = defineStore('map', {
           asynchronous: true
         })
         this.viewer.scene.primitives.add(primitive)
-        this.beiDouGridPrimitive = primitive
+        if (saveAsResultLayer) this.beiDouGridResultPrimitive = primitive
+        else this.beiDouGridPrimitive = primitive
 
         let outlinePrimitive = null
         if (outlineGeometryInstances.length > 0) {
@@ -561,7 +677,8 @@ export const useMapStore = defineStore('map', {
           })
           this.viewer.scene.primitives.add(outlinePrimitive)
         }
-        this.beiDouGridOutlinePrimitive = outlinePrimitive
+        if (saveAsResultLayer) this.beiDouGridResultOutlinePrimitive = outlinePrimitive
+        else this.beiDouGridOutlinePrimitive = outlinePrimitive
       } else {
         // ✅ 超大规模：GPU 实例化（单几何 + batches）
         const scene = this.viewer.scene
@@ -574,7 +691,8 @@ export const useMapStore = defineStore('map', {
             groundHeights,
             gridX,
             gridY,
-            gridZ
+            gridZ,
+            hiddenInstanceIndices
           }
         )
 
@@ -601,38 +719,48 @@ export const useMapStore = defineStore('map', {
         )
 
         scene.primitives.add(primitive)
-        this.beiDouGridPrimitive = primitive
-        this.beiDouGridInstancedPrimitives = [primitive]
-        this.beiDouGridOutlinePrimitive = null
+        if (saveAsResultLayer) {
+          this.beiDouGridResultPrimitive = primitive
+          this.beiDouGridResultInstancedPrimitives = [primitive]
+          this.beiDouGridResultOutlinePrimitive = null
+        } else {
+          this.beiDouGridPrimitive = primitive
+          this.beiDouGridInstancedPrimitives = [primitive]
+          this.beiDouGridOutlinePrimitive = null
+        }
         renderedCount = gridData.instanceCount
       }
 
-      this.beiDouGridMeta = {
-        bounds: normalizedBounds,
-        dx,
-        dy,
-        dz,
-        // 用户输入的离地高度（相对 terrain 的“离地高度”语义）
-        zMin,
-        zMax,
-        zMinRel: zMin,
-        zMaxRel: zMax,
-        // ENU 原点（originLon,originLat）处：绝对椭球高度 = originGroundHeight + zMin
-        zStartAbsOrigin: originGroundHeight + zMin,
-        gridX,
-        gridY,
-        gridZ,
-        renderedCount,
-        renderStep: 1,
-        originGroundHeight,
-        originLon,
-        originLat,
-        originCartesian,
-        originENU,
-        groundHeights,
-        fillColor: baseFillColor,
-        outlineColor: baseOutlineColor,
-        renderMode: useInstancing ? 'instanced' : 'geometryInstances'
+      if (!saveAsResultLayer) {
+        this.beiDouGridMeta = {
+          bounds: normalizedBounds,
+          dx,
+          dy,
+          dz,
+          // 用户输入的离地高度（相对 terrain 的“离地高度”语义）
+          zMin,
+          zMax,
+          zMinRel: zMin,
+          zMaxRel: zMax,
+          // ENU 原点（originLon,originLat）处：绝对椭球高度 = originGroundHeight + zMin
+          zStartAbsOrigin: originGroundHeight + zMin,
+          gridX,
+          gridY,
+          gridZ,
+          renderedCount,
+          renderStep: 1,
+          originGroundHeight,
+          originLon,
+          originLat,
+          originCartesian,
+          originENU,
+          groundHeights,
+          fillColor: baseFillColor,
+          outlineColor: baseOutlineColor,
+          baseFillColor,
+          baseOutlineColor,
+          renderMode: useInstancing ? 'instanced' : 'geometryInstances'
+        }
       }
 
       const result = {
@@ -659,18 +787,17 @@ export const useMapStore = defineStore('map', {
       const removePrimitiveSafe = (primitive) => {
         if (!primitive) return
         try {
+          const inScene = this.viewer.scene?.primitives?.contains?.(primitive) === true
+          if (inScene) {
+            this.viewer.scene.primitives.remove(primitive)
+            return
+          }
           if (typeof primitive.isDestroyed === 'function') {
             if (!primitive.isDestroyed()) {
-              this.viewer.scene.primitives.remove(primitive)
-              if (typeof primitive.destroy === 'function') {
-                primitive.destroy()
-              }
+              this.schedulePrimitiveDestroy(primitive)
             }
           } else {
-            this.viewer.scene.primitives.remove(primitive)
-            if (typeof primitive.destroy === 'function') {
-              primitive.destroy()
-            }
+            this.schedulePrimitiveDestroy(primitive)
           }
         } catch (e) {
           // 忽略已销毁对象的错误
@@ -679,28 +806,38 @@ export const useMapStore = defineStore('map', {
 
       removePrimitiveSafe(this.beiDouGridPrimitive)
       removePrimitiveSafe(this.beiDouGridOutlinePrimitive)
+      removePrimitiveSafe(this.beiDouGridResultPrimitive)
+      removePrimitiveSafe(this.beiDouGridResultOutlinePrimitive)
       removePrimitiveSafe(this.beiDouGridSelectedPrimitive)
       if (Array.isArray(this.beiDouGridInstancedPrimitives)) {
         this.beiDouGridInstancedPrimitives.forEach(p => removePrimitiveSafe(p))
+      }
+      if (Array.isArray(this.beiDouGridResultInstancedPrimitives)) {
+        this.beiDouGridResultInstancedPrimitives.forEach(p => removePrimitiveSafe(p))
       }
 
       this.beiDouGridPrimitive = null
       this.beiDouGridOutlinePrimitive = null
       this.beiDouGridInstancedPrimitives = []
+      this.beiDouGridResultPrimitive = null
+      this.beiDouGridResultOutlinePrimitive = null
+      this.beiDouGridResultInstancedPrimitives = []
       this.beiDouGridMeta = null
       this.beiDouGridSelectedPrimitive = null
       this.selectedBeiDouCellId = null
       this.selectedBeiDouCellInfo = null
+
+      this.beiDouLastCompactResult = null
     },
 
     /**
      * 选中或取消选中某个北斗格网单元
      */
     selectBeiDouCell(cellId) {
-      if (!this.viewer || !this.beiDouGridPrimitive) return
+      const primitive = this.activeBeiDouCellPrimitive
+      if (!this.viewer || !primitive) return
 
-      const primitive = this.beiDouGridPrimitive
-      const outlinePrimitive = this.beiDouGridOutlinePrimitive
+      const outlinePrimitive = this.activeBeiDouCellOutlinePrimitive
       const isInstanced = this.beiDouGridMeta && this.beiDouGridMeta.renderMode === 'instanced'
       const requestRenderSafe = () => {
         try {
@@ -715,7 +852,7 @@ export const useMapStore = defineStore('map', {
         try {
           const prevAttr = primitive.getGeometryInstanceAttributes(this.selectedBeiDouCellId)
           if (prevAttr && prevAttr.color) {
-            const baseColor = this.beiDouGridMeta?.fillColor || new Cesium.Color(0.0, 0.9, 1.0, 0.25)
+            const baseColor = this.beiDouGridMeta?.fillColor || new Cesium.Color(0.0, 0.9, 1.0, 0.05)
             prevAttr.color = Cesium.ColorGeometryInstanceAttribute.toValue(baseColor)
           }
         } catch (e) {
@@ -725,7 +862,7 @@ export const useMapStore = defineStore('map', {
           if (outlinePrimitive) {
             const prevOutlineAttr = outlinePrimitive.getGeometryInstanceAttributes(this.selectedBeiDouCellId)
             if (prevOutlineAttr && prevOutlineAttr.color) {
-              const baseOutlineColor = this.beiDouGridMeta?.outlineColor || Cesium.Color.BLACK.withAlpha(0.8)
+              const baseOutlineColor = this.beiDouGridMeta?.outlineColor || Cesium.Color.BLACK.withAlpha(0.95)
               prevOutlineAttr.color = Cesium.ColorGeometryInstanceAttribute.toValue(baseOutlineColor)
             }
           }

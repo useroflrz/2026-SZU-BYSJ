@@ -23,7 +23,7 @@
 
 ```bash
 # 进入后端目录
-cd backend
+cd backend  
 
 # 创建 conda 环境
 conda create -n gis3d-backend python=3.9 -y

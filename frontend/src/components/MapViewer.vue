@@ -113,8 +113,9 @@ onMounted(async () => {
       let id = null
       const picked = viewer.scene.pick(movement.position)
       if (picked && picked.id) id = picked.id
-      if ((typeof id !== 'string' || !id.startsWith('beidou-cell-')) && mapStore.beiDouGridMeta?.renderMode === 'instanced' && mapStore.beiDouGridPrimitive?.pick) {
-        const globalId = mapStore.beiDouGridPrimitive.pick(viewer.scene, movement.position.x, movement.position.y)
+      const instancedPickPrim = mapStore.activeBeiDouCellPrimitive
+      if ((typeof id !== 'string' || !id.startsWith('beidou-cell-')) && mapStore.beiDouGridMeta?.renderMode === 'instanced' && instancedPickPrim?.pick) {
+        const globalId = instancedPickPrim.pick(viewer.scene, movement.position.x, movement.position.y)
         if (globalId >= 0 && mapStore.beiDouGridMeta) {
           const { gridX, gridY } = mapStore.beiDouGridMeta
           const layerSize = gridX * gridY

@@ -1,4 +1,9 @@
 import { defineStore } from 'pinia'
+import {
+  createGridViewshedJob,
+  getGridViewshedJobResult,
+  getGridViewshedJobStatus
+} from '../Analysis/apiClient'
 
 export const useAnalysisStore = defineStore('analysis', {
   state: () => ({
@@ -8,7 +13,11 @@ export const useAnalysisStore = defineStore('analysis', {
     isAnalyzing: false,
     stats: null,
     gridMeta: null,
-    layerStats: []
+    layerStats: [],
+    // 当前分析类型：固定使用格网可视域后端分析
+    analysisType: null,
+    preferredAnalysisMode: 'grid-viewshed-1_4ghz',
+    gridViewshedResult: null
   }),
 
   getters: {
@@ -23,6 +32,14 @@ export const useAnalysisStore = defineStore('analysis', {
         ...s,
         position: s.position ? { ...s.position } : s.position
       }))
+    },
+
+    setGridMeta(meta) {
+      this.gridMeta = meta ? { ...meta } : null
+    },
+
+    setPreferredAnalysisMode(mode) {
+      this.preferredAnalysisMode = mode || 'grid-viewshed-1_4ghz'
     },
 
     addStation(station) {
@@ -56,91 +73,138 @@ export const useAnalysisStore = defineStore('analysis', {
       this.isAnalyzing = isAnalyzing
     },
 
-    async runAnalysis(params) {
+    _sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms))
+    },
+
+    async _toNumberArrayChunked(source, chunkSize = 50000) {
+      if (!source || !Number.isFinite(source.length) || source.length <= 0) return []
+      if (Array.isArray(source)) return source
+
+      const len = source.length
+      const out = new Array(len)
+      for (let i = 0; i < len; i += chunkSize) {
+        const end = Math.min(len, i + chunkSize)
+        for (let j = i; j < end; j++) out[j] = source[j]
+        // 让出主线程，避免大数组转换导致页面假死
+        // eslint-disable-next-line no-await-in-loop
+        await this._sleep(0)
+      }
+      return out
+    },
+
+    _buildCompactResultFromBackend(payload) {
+      const total = payload?.total || 0
+      const gridX = payload?.gridX || 0
+      const gridY = payload?.gridY || 0
+      const gridZ = payload?.gridZ || 0
+      const uncovered = Array.isArray(payload?.uncoveredIndices) ? payload.uncoveredIndices : []
+
+      return {
+        type: 'gridViewshedCompact',
+        total,
+        gridX,
+        gridY,
+        gridZ,
+        uncoveredIndices: uncovered,
+        stats: payload?.stats || {
+          totalPoints: total,
+          visiblePoints: 0,
+          invisiblePoints: total,
+          visibilityRatio: 0
+        },
+        layerStats: payload?.layerStats || []
+      }
+    },
+
+    async runGridViewshedAnalysis(params) {
       this.isAnalyzing = true
       this.analysisProgress = 0
       this.stats = null
       this.layerStats = []
+      this.analysisType = 'grid-viewshed-1_4ghz'
 
-      // 模拟：按网格点生成可见性结果，简单随机
-      const total = this.gridMeta ? this.gridMeta.totalEstimate || 0 : 0
+      // 动态引入 mapStore，避免循环依赖初始化问题
+      const { useMapStore } = await import('./map')
+      const mapStore = useMapStore()
 
-      // 先根据简单规则给每个格网点生成可视性结果
-      const baseResults = []
+      const gridMeta = mapStore.beiDouGridMeta || this.gridMeta
+      const stations = this.stations || []
 
-      // 如果有格网元数据，则根据高度映射出所属层索引，便于结果按层统计/筛选
-      let results = baseResults
-      const meta = this.gridMeta
-      if (meta && typeof meta.zMin === 'number' && typeof meta.dz === 'number' && meta.dz > 0) {
-        const layerCount = meta.zCount || Math.max(1, Math.floor((meta.zMax - meta.zMin) / meta.dz))
-        results = baseResults.map((pt) => {
-          const rawIndex = Math.round((pt.height - meta.zMin) / meta.dz)
-          const layerIndex = Math.min(
-            Math.max(rawIndex, 0),
-            layerCount - 1
-          )
-          return {
-            ...pt,
-            layerIndex
-          }
-        })
-      }
-
-      // 伪进度
-      for (let p = 0; p <= 100; p += 10) {
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise(resolve => setTimeout(resolve, 80))
-        this.analysisProgress = p
-      }
-
-      this.analysisResult = results
-
-      // 全局统计
-      const visible = results.filter(r => r.visible).length
-      this.stats = {
-        totalPoints: total,
-        visiblePoints: visible,
-        invisiblePoints: total - visible,
-        visibilityRatio: total === 0 ? 0 : visible / total
-      }
-
-      // 按层统计（仅当存在 layerIndex 时）
-      if (results.length > 0 && typeof results[0].layerIndex === 'number') {
-        const maxLayer = results.reduce(
-          (acc, r) => (typeof r.layerIndex === 'number' ? Math.max(acc, r.layerIndex) : acc),
-          0
-        )
-        const layerCount = maxLayer + 1
-        const layerStats = Array.from({ length: layerCount }, (_, idx) => ({
-          layerIndex: idx,
+      if (!gridMeta || stations.length === 0) {
+        this.isAnalyzing = false
+        this.analysisResult = []
+        this.stats = {
           totalPoints: 0,
           visiblePoints: 0,
           invisiblePoints: 0,
-          visibilityRatio: 0,
-          zMin: meta ? meta.zMin + idx * (meta.dz || 0) : null,
-          zMax: meta ? meta.zMin + (idx + 1) * (meta.dz || 0) : null
-        }))
-
-        results.forEach((r) => {
-          const li = typeof r.layerIndex === 'number' ? r.layerIndex : 0
-          const stat = layerStats[li]
-          stat.totalPoints += 1
-          if (r.visible) {
-            stat.visiblePoints += 1
-          } else {
-            stat.invisiblePoints += 1
-          }
-        })
-
-        this.layerStats = layerStats.map((s) => ({
-          ...s,
-          visibilityRatio: s.totalPoints === 0 ? 0 : s.visiblePoints / s.totalPoints
-        }))
-      } else {
+          visibilityRatio: 0
+        }
         this.layerStats = []
+        return []
       }
+
+      const payload = {
+        stations: stations.map((s) => {
+          const lon = s.position?.lon ?? s.lon
+          const lat = s.position?.lat ?? s.lat
+          const absHeight = s.meta?.absoluteHeight
+          const groundHeight = s.meta?.groundHeight
+          const h = typeof absHeight === 'number' ? absHeight : (groundHeight ?? 0) + (s.position?.height ?? 0)
+          return { lon, lat, height: h }
+        }).filter(tx => Number.isFinite(tx.lon) && Number.isFinite(tx.lat) && Number.isFinite(tx.height)),
+        gridMeta: {
+          gridX: gridMeta.gridX,
+          gridY: gridMeta.gridY,
+          gridZ: gridMeta.gridZ,
+          dx: gridMeta.dx,
+          dy: gridMeta.dy,
+          dz: gridMeta.dz,
+          zMinRel: gridMeta.zMinRel ?? gridMeta.zMin ?? 0,
+          originLon: gridMeta.originLon,
+          originLat: gridMeta.originLat,
+          originGroundHeight: gridMeta.originGroundHeight ?? 0,
+          groundHeights: await this._toNumberArrayChunked(gridMeta.groundHeights || [])
+        },
+        params: {
+          maxDistance: params.maxDistance || 10000,
+          clearance: params.clearance || 3,
+          losSamplesMin: params.losSamplesMin || 8,
+          losSamplesMax: params.losSamplesMax || 40,
+          progressBatchCells: params.progressBatchCells || 10000
+        }
+      }
+
+      const created = await createGridViewshedJob(payload)
+      const jobId = created.jobId
+      let status = created.status
+      while (status === 'queued' || status === 'running') {
+        // eslint-disable-next-line no-await-in-loop
+        await this._sleep(500)
+        // eslint-disable-next-line no-await-in-loop
+        const s = await getGridViewshedJobStatus(jobId)
+        status = s.status
+        this.analysisProgress = Math.max(0, Math.min(100, Math.round(s.progress || 0)))
+      }
+      const resultResp = await getGridViewshedJobResult(jobId)
+      if (resultResp.status !== 'done' || !resultResp.result) {
+        throw new Error(resultResp.error || '后端分析失败')
+      }
+      const compactResult = this._buildCompactResultFromBackend(resultResp.result)
+
+      this.analysisResult = compactResult
+      this.stats = compactResult?.stats || {
+        totalPoints: 0,
+        visiblePoints: 0,
+        invisiblePoints: 0,
+        visibilityRatio: 0
+      }
+      this.layerStats = compactResult?.layerStats || []
+
       this.isAnalyzing = false
-      return results
+      this.analysisProgress = 100
+      this.gridViewshedResult = compactResult
+      return compactResult
     },
 
     clearResults() {
@@ -149,11 +213,12 @@ export const useAnalysisStore = defineStore('analysis', {
       this.isAnalyzing = false
       this.stats = null
       this.layerStats = []
+      this.analysisType = null
+      this.gridViewshedResult = null
     },
 
     clearAll() {
       this.stations = []
-      this.gridPoints = []
       this.clearResults()
     }
   }

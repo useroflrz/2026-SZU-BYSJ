@@ -19,13 +19,6 @@
             style="width: 100%"
           />
         </el-form-item>
-        <el-form-item label="站点类型">
-          <el-select v-model="autoForm.type" style="width: 100%">
-            <el-option label="基站" value="base" />
-            <el-option label="中继站" value="relay" />
-            <el-option label="终端" value="terminal" />
-          </el-select>
-        </el-form-item>
         <el-form-item>
           <el-button
             type="primary"
@@ -148,13 +141,6 @@
             style="width: 100%"
           />
         </el-form-item>
-        <el-form-item label="站点类型">
-          <el-select v-model="editingStation.type" style="width: 100%">
-            <el-option label="基站" value="base" />
-            <el-option label="中继站" value="relay" />
-            <el-option label="终端" value="terminal" />
-          </el-select>
-        </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="saveStation" style="width: 100%">保存</el-button>
           <el-button @click="cancelEdit" style="width: 100%; margin-top: 8px;">取消</el-button>
@@ -174,7 +160,7 @@ import { useMapStore } from '../stores/map'
 
 const analysisStore = useAnalysisStore()
 const mapStore = useMapStore()
-const addMode = ref('auto')
+const addMode = ref('import')
 const importFormat = ref('csv')
 
 const form = ref({})
@@ -191,9 +177,11 @@ const AUTO_STATION_COUNT = 10
 const DEFAULT_STATION_AGL_M = 30
 
 const autoForm = ref({
-  frequency: 2.4,
-  type: 'base'
+  frequency: 2.4
 })
+
+const TEST_DEFAULT_STATION_CSV_PATH = 'E:/biyesheji/data/jizhandian/jizhandian_plan.csv'
+const DEFAULT_STATION_CSV_FETCH_URL = `/@fs/${TEST_DEFAULT_STATION_CSV_PATH}`
 
 const canAutoPick = computed(() => {
   return !!mapStore.selectedRegion && !!mapStore.viewer
@@ -323,7 +311,7 @@ const autoSelectStations = async () => {
     return
   }
 
-  const { frequency, type } = autoForm.value
+  const { frequency } = autoForm.value
 
   isAutoPicking.value = true
   autoSummary.value = ''
@@ -349,7 +337,7 @@ const autoSelectStations = async () => {
           height: agl
         },
         frequency,
-        type,
+        type: 'base',
         meta: {
           groundHeight: gh,
           absoluteHeight: gh + agl
@@ -358,6 +346,7 @@ const autoSelectStations = async () => {
     })
 
     analysisStore.setStations(selected)
+    analysisStore.setPreferredAnalysisMode('grid-viewshed-1_4ghz')
     mapStore.setStations(selected)
 
     const ghMin = Math.min(...selected.map((s) => s.meta.groundHeight))
@@ -365,6 +354,7 @@ const autoSelectStations = async () => {
     autoSummary.value =
       `已生成 ${selected.length} 个均匀分布站点；在线地形椭球高程约 ${ghMin.toFixed(1)}～${ghMax.toFixed(1)} m（天线离地 ${agl} m，绝对海拔见各站点 meta.absoluteHeight）`
     ElMessage.success('自动选点完成，站点已渲染到地图')
+    ElMessage.info('下一步请生成格网，然后可直接运行格网可视域(1.4GHz)分析')
   } catch (e) {
     ElMessage.error(`自动选点失败：${e?.message || '未知错误'}`)
   } finally {
@@ -380,64 +370,81 @@ const clearStations = () => {
   ElMessage.info('站点已清空')
 }
 
+const parseCsvStations = (content) => {
+  const lines = content.split(/\r?\n/).filter(Boolean)
+  const parsed = []
+  const firstCols = (lines[0] || '').split(',').map(s => s.trim())
+  const firstLon = Number(firstCols[1])
+  const firstLat = Number(firstCols[2])
+  // 如果首行 lon/lat 无法转为数字，则当作表头；否则当作数据行
+  const startIndex = Number.isFinite(firstLon) && Number.isFinite(firstLat) ? 0 : 1
+
+  lines.slice(startIndex).forEach(line => {
+    const cols = line.split(',').map(s => s.trim())
+    const [name, lon, lat, height, frequency] = cols
+    const lonNum = Number(lon)
+    const latNum = Number(lat)
+    if (name && Number.isFinite(lonNum) && Number.isFinite(latNum)) {
+      parsed.push({
+        id: `${Date.now()}-${parsed.length}`,
+        name: name.trim(),
+        position: {
+          lon: lonNum,
+          lat: latNum,
+          height: Number(height) || 0
+        },
+        frequency: Number(frequency) || 1.4,
+        type: 'base'
+      })
+    }
+  })
+  return parsed
+}
+
+const parseGeoJsonStations = (content) => {
+  const geo = JSON.parse(content)
+  const features = geo.features || []
+  return features
+    .filter(f => f.geometry?.type === 'Point')
+    .map((f, idx) => {
+      // 兼容两类数据：
+      // 1) geometry.coordinates 为 [lon, lat, height?]（WGS84）
+      // 2) geometry 为投影坐标（如 EPSG:4547），但 properties 里包含 lon/lat（示例数据就是这种）
+      const propLon = f.properties?.lon
+      const propLat = f.properties?.lat
+      const lon = propLon !== undefined && propLon !== null ? Number(propLon) : Number(f.geometry.coordinates?.[0])
+      const lat = propLat !== undefined && propLat !== null ? Number(propLat) : Number(f.geometry.coordinates?.[1])
+      const height =
+        f.properties?.height !== undefined ? Number(f.properties.height)
+          : f.properties?.altitude !== undefined ? Number(f.properties.altitude)
+            : f.properties?.Z !== undefined ? Number(f.properties.Z)
+              : (f.geometry.coordinates?.[2] !== undefined ? Number(f.geometry.coordinates[2]) : 0)
+      return {
+        id: `${Date.now()}-${idx}`,
+        name: f.properties?.name || `站点${idx + 1}`,
+        position: { lon, lat, height },
+        frequency: Number(f.properties?.frequency) || 1.4,
+        type: 'base'
+      }
+    })
+}
+
+const applyImportedStations = (parsed) => {
+  analysisStore.setStations(parsed)
+  mapStore.setStations(parsed)
+  ElMessage.success(`已导入 ${parsed.length} 个站点`)
+}
+
 const handleFileImport = (file) => {
   ElMessage.info('文件选择: ' + file.name)
   const reader = new FileReader()
   reader.onload = (e) => {
     try {
       const content = e.target.result
-      if (importFormat.value === 'csv') {
-        const lines = content.split(/\r?\n/).filter(Boolean)
-        const parsed = []
-        lines.slice(1).forEach(line => {
-          const [name, lon, lat, height, frequency, type] = line.split(',')
-          if (name && lon && lat) {
-            parsed.push({
-              id: `${Date.now()}-${parsed.length}`,
-              name: name.trim(),
-              position: {
-                lon: Number(lon),
-                lat: Number(lat),
-                height: Number(height) || 0
-              },
-              frequency: Number(frequency) || 1.4,
-              type: (type || 'base').trim()
-            })
-          }
-        })
-        parsed.forEach(st => analysisStore.addStation(st))
-        mapStore.setStations(analysisStore.stations)
-        ElMessage.success(`已导入 ${parsed.length} 个站点`)
-      } else if (importFormat.value === 'geojson') {
-        const geo = JSON.parse(content)
-        const features = geo.features || []
-        const parsed = features
-          .filter(f => f.geometry?.type === 'Point')
-          .map((f, idx) => {
-            // 兼容两类数据：
-            // 1) geometry.coordinates 为 [lon, lat, height?]（WGS84）
-            // 2) geometry 为投影坐标（如 EPSG:4547），但 properties 里包含 lon/lat（示例数据就是这种）
-            const propLon = f.properties?.lon
-            const propLat = f.properties?.lat
-            const lon = propLon !== undefined && propLon !== null ? Number(propLon) : Number(f.geometry.coordinates?.[0])
-            const lat = propLat !== undefined && propLat !== null ? Number(propLat) : Number(f.geometry.coordinates?.[1])
-            const height =
-              f.properties?.height !== undefined ? Number(f.properties.height)
-              : f.properties?.altitude !== undefined ? Number(f.properties.altitude)
-              : f.properties?.Z !== undefined ? Number(f.properties.Z)
-              : (f.geometry.coordinates?.[2] !== undefined ? Number(f.geometry.coordinates[2]) : 0)
-            return {
-              id: `${Date.now()}-${idx}`,
-              name: f.properties?.name || `站点${idx + 1}`,
-              position: { lon, lat, height },
-              frequency: Number(f.properties?.frequency) || 1.4,
-              type: f.properties?.type || 'base'
-            }
-          })
-        parsed.forEach(st => analysisStore.addStation(st))
-        mapStore.setStations(analysisStore.stations)
-        ElMessage.success(`已导入 ${parsed.length} 个站点`)
-      }
+      const parsed = importFormat.value === 'csv'
+        ? parseCsvStations(content)
+        : parseGeoJsonStations(content)
+      applyImportedStations(parsed)
     } catch (err) {
       ElMessage.error('导入失败，请检查文件格式')
     }
@@ -445,14 +452,33 @@ const handleFileImport = (file) => {
   reader.readAsText(file.raw)
 }
 
+const autoImportDefaultStations = async () => {
+  try {
+    if (importFormat.value !== 'csv') importFormat.value = 'csv'
+    const response = await fetch(DEFAULT_STATION_CSV_FETCH_URL)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`)
+    }
+    const content = await response.text()
+    const parsed = parseCsvStations(content)
+    applyImportedStations(parsed)
+    ElMessage.info(`测试期已自动导入默认文件：${TEST_DEFAULT_STATION_CSV_PATH}`)
+  } catch (err) {
+    ElMessage.warning(`自动导入默认站点失败，请手动选择文件：${TEST_DEFAULT_STATION_CSV_PATH}`)
+  }
+}
+
 const editStation = (station) => {
   editingStation.value = { 
     ...station,
     position: { ...station.position }
   }
+  // 仅支持基站：编辑也强制覆盖为 base
+  editingStation.value.type = 'base'
 }
 
 const saveStation = () => {
+  editingStation.value.type = 'base'
   analysisStore.updateStation(editingStation.value.id, editingStation.value)
   mapStore.setStations(analysisStore.stations)
   editingStation.value = null
@@ -473,6 +499,7 @@ onMounted(() => {
   if (mapStore.viewer) {
     mapStore.setStations(analysisStore.stations)
   }
+  autoImportDefaultStations()
 })
 </script>
 

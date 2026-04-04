@@ -181,9 +181,9 @@ const form = reactive({
   zMax: 500,
   autoUseDSMBounds: true,
   fillColor: '#00e0ff',
-  fillOpacity: 0.25,
+  fillOpacity: 0.05,
   outlineColor: '#00e0ff',
-  outlineOpacity: 0.6,
+  outlineOpacity: 0.95,
   bounds: {
     minLon: 114.0,
     maxLon: 114.1,
@@ -241,7 +241,6 @@ const generateGrid = async () => {
 
   try {
     // 北斗网格：使用自定义 Primitive 做 3D 网格渲染
-    mapStore.setGridPoints([]) // 不再用点图层
     const primitiveInfo = await mapStore.showBeiDouGrid(bounds, {
       dx: form.dx,
       dy: form.dy,
@@ -264,9 +263,14 @@ const generateGrid = async () => {
       pointsPerLayer: primitiveInfo.pointsPerLayer
     }
 
+    // 同步给 analysisStore，便于分析模块直接消费格网元数据
+    analysisStore.setGridMeta(mapStore.beiDouGridMeta)
+    analysisStore.setPreferredAnalysisMode('grid-viewshed-1_4ghz')
+
     ElMessage.success(
       `格网生成完成，共 ${primitiveInfo.total.toLocaleString()} 个格网单元（已贴地：terrain采样，离地高度范围：${form.zMin}~${form.zMax}m）`
     )
+    ElMessage.info('可前往“分析参数”直接运行格网可视域(1.4GHz)分析')
   } catch (e) {
     ElMessage.error(`格网生成失败：${e?.message || '未知错误'}`)
   } finally {
@@ -282,16 +286,15 @@ const resetForm = () => {
   form.zMax = 500
   form.autoUseDSMBounds = true
   form.fillColor = '#00e0ff'
-  form.fillOpacity = 0.25
+  form.fillOpacity = 0.05
   form.outlineColor = '#00e0ff'
-  form.outlineOpacity = 0.6
+  form.outlineOpacity = 0.95
   gridInfo.value = {
     pointCount: 0,
     layerCount: 0,
     pointsPerLayer: 0
   }
-  analysisStore.setGridPoints([])
-  mapStore.setGridPoints([])
+  analysisStore.setGridMeta(null)
   mapStore.clearBeiDouGrid()
   ElMessage.info('表单已重置')
 }
@@ -308,7 +311,7 @@ const safeUpdateBeiDouFillStyle = () => {
       ? Cesium.Color.fromCssColorString(form.fillColor)
       : new Cesium.Color(0.0, 0.9, 1.0, 1.0)
     ).withAlpha(
-      typeof form.fillOpacity === 'number' ? form.fillOpacity : 0.25
+      typeof form.fillOpacity === 'number' ? form.fillOpacity : 0.05
     )
     for (let ix = 0; ix < gridX; ix++) {
       for (let iy = 0; iy < gridY; iy++) {
@@ -344,7 +347,7 @@ const handleOutlineStyleChange = () => {
         ? Cesium.Color.fromCssColorString(form.outlineColor)
         : Cesium.Color.BLACK
       ).withAlpha(
-        typeof form.outlineOpacity === 'number' ? form.outlineOpacity : 0.8
+        typeof form.outlineOpacity === 'number' ? form.outlineOpacity : 0.95
       )
 
       mapStore.beiDouGridMeta.outlineColor = color
@@ -373,7 +376,7 @@ const handleOutlineStyleChange = () => {
       ? Cesium.Color.fromCssColorString(form.outlineColor)
       : Cesium.Color.BLACK
     ).withAlpha(
-      typeof form.outlineOpacity === 'number' ? form.outlineOpacity : 0.8
+      typeof form.outlineOpacity === 'number' ? form.outlineOpacity : 0.95
     )
 
     for (let ix = 0; ix < gridX; ix++) {

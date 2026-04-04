@@ -23,6 +23,7 @@ const scratchInstanceMatrix = new Cesium.Matrix4()
  * @param {Object} bounds - 矩形范围 { minLon, minLat, maxLon, maxLat }（度）
  * @param {Object} gridParams - { dx, dy, dz, zMin, zMax } 单位：米
  * @param {Object} [options] - { origin: 'minCorner' }
+ * @param {number[]} [options.hiddenInstanceIndices] - instanced 模式下：需要隐藏的实例索引（将实例矩阵缩放退化为不可见）。
  * @returns {{ modelMatrix: Cesium.Matrix4, geometry: Cesium.Geometry, matrixData: Float32Array, instanceCount: number, batches: Array<{ matrixData: Float32Array, instanceCount: number }> }}
  */
 export function createGridInstancesFromBounds(bounds, gridParams, options = {}) {
@@ -105,6 +106,21 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
   const matrixData = new Float32Array(16 * total)
   const matrixArray = new Float32Array(16)
 
+  // instanced mask: 将特定实例缩放退化为 0，避免在场景中渲染出对应格网。
+  const hiddenInstanceFlags =
+    Array.isArray(options.hiddenInstanceIndices) && options.hiddenInstanceIndices.length > 0
+      ? (() => {
+          const flags = new Uint8Array(total)
+          for (let i = 0; i < options.hiddenInstanceIndices.length; i++) {
+            const idx = options.hiddenInstanceIndices[i]
+            if (!Number.isFinite(idx)) continue
+            if (idx < 0 || idx >= total) continue
+            flags[idx] = 1
+          }
+          return flags
+        })()
+      : null
+
   for (let iz = 0; iz < gridZ; iz++) {
     for (let iy = 0; iy < gridY; iy++) {
       for (let ix = 0; ix < gridX; ix++) {
@@ -118,13 +134,19 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
             ? groundHeights[colIndex]
             : originGroundHeight
         const localZ = zMin + (iz + 0.5) * dz + (groundH - originGroundHeight)
-        Cesium.Matrix4.fromTranslation(
-          new Cesium.Cartesian3(localX, localY, localZ),
-          scratchTranslation
-        )
+        Cesium.Matrix4.fromTranslation(new Cesium.Cartesian3(localX, localY, localZ), scratchTranslation)
+
+        // 退化矩阵：将盒体缩放为 0（不改 shader，实现“不可见”）
+        const instanceIndex = iz * gridX * gridY + iy * gridX + ix
+        if (hiddenInstanceFlags && hiddenInstanceFlags[instanceIndex] === 1) {
+          // 注意：Matrix4 的对角线元素对应缩放（Cesium 内部矩阵表示）
+          scratchTranslation[0] = 0
+          scratchTranslation[5] = 0
+          scratchTranslation[10] = 0
+        }
         Cesium.Matrix4.multiply(originENU, scratchTranslation, scratchInstanceMatrix)
         Cesium.Matrix4.toArray(scratchInstanceMatrix, matrixArray)
-        const base = (iz * gridX * gridY + iy * gridX + ix) * 16
+        const base = instanceIndex * 16
         matrixData.set(matrixArray, base)
       }
     }
@@ -176,10 +198,13 @@ attribute vec4 instanceMatrix0;
 attribute vec4 instanceMatrix1;
 attribute vec4 instanceMatrix2;
 attribute vec4 instanceMatrix3;
+attribute float instanceVisible;
 varying vec3 v_localPos;
+varying float v_instanceVisible;
 void main() {
   mat4 instanceMatrix = mat4(instanceMatrix0, instanceMatrix1, instanceMatrix2, instanceMatrix3);
   v_localPos = position;
+  v_instanceVisible = instanceVisible;
   gl_Position = czm_viewProjection * instanceMatrix * vec4(position, 1.0);
 }
 `
@@ -192,6 +217,7 @@ uniform vec3 u_halfSize;
 uniform float u_wireframeShow;
 uniform float u_wireframeEdgeRatio;
 varying vec3 v_localPos;
+varying float v_instanceVisible;
 
 float edgeMaskFromLocalPos(vec3 localPos, vec3 halfSize, float edgeRatio) {
   vec3 safeHalf = max(halfSize, vec3(0.0001));
@@ -204,6 +230,7 @@ float edgeMaskFromLocalPos(vec3 localPos, vec3 halfSize, float edgeRatio) {
 }
 
 void main() {
+  if (v_instanceVisible < 0.5) discard;
   float edgeMask = edgeMaskFromLocalPos(v_localPos, u_halfSize, u_wireframeEdgeRatio) * u_wireframeShow;
   vec4 mixedColor = mix(u_fillColor, u_outlineColor, edgeMask);
   gl_FragColor = mixedColor;
@@ -330,6 +357,8 @@ export class BeiDouGridPrimitive {
     this._pickWebGL1 = false
     this._pickVaoExt = null
     this._pickInstancedExt = null
+    this._visibilityByBatch = []
+    this._visibilityBuffers = []
   }
 
   get isDestroyed() {
@@ -553,7 +582,8 @@ export class BeiDouGridPrimitive {
       instanceMatrix0: 2,
       instanceMatrix1: 3,
       instanceMatrix2: 4,
-      instanceMatrix3: 5
+      instanceMatrix3: 5,
+      instanceVisible: 6
     }
 
     // 使用 ShaderSource 以确保 Cesium 内置变量（czm_*）与默认 precision/defines 正确注入
@@ -621,6 +651,8 @@ export class BeiDouGridPrimitive {
     })
 
     this._commandList = []
+    this._visibilityByBatch = []
+    this._visibilityBuffers = []
     const componentDatatype = Cesium.ComponentDatatype.FLOAT
     const stride = 16 * 4
 
@@ -631,6 +663,15 @@ export class BeiDouGridPrimitive {
         typedArray: batch.matrixData,
         usage: Cesium.BufferUsage.STATIC_DRAW
       })
+      const visibilityArray = new Float32Array(batch.instanceCount)
+      visibilityArray.fill(1.0)
+      const visibilityBuffer = Cesium.Buffer.createVertexBuffer({
+        context,
+        typedArray: visibilityArray,
+        usage: Cesium.BufferUsage.DYNAMIC_DRAW
+      })
+      this._visibilityByBatch.push(visibilityArray)
+      this._visibilityBuffers.push(visibilityBuffer)
 
       const attributes = [
         {
@@ -674,6 +715,15 @@ export class BeiDouGridPrimitive {
           offsetInBytes: 48,
           strideInBytes: stride,
           instanceDivisor: 1
+        },
+        {
+          index: 6,
+          vertexBuffer: visibilityBuffer,
+          componentDatatype,
+          componentsPerAttribute: 1,
+          offsetInBytes: 0,
+          strideInBytes: 4,
+          instanceDivisor: 1
         }
       ]
 
@@ -708,6 +758,42 @@ export class BeiDouGridPrimitive {
     })
 
     this._ready = true
+  }
+
+  _syncVisibilityBatch(batchIndex) {
+    const buffer = this._visibilityBuffers?.[batchIndex]
+    const values = this._visibilityByBatch?.[batchIndex]
+    if (!buffer || !values) return
+    try {
+      buffer.copyFromArrayView(values)
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  setAllInstancesVisibility(visible) {
+    const value = visible ? 1.0 : 0.0
+    for (let b = 0; b < this._visibilityByBatch.length; b++) {
+      this._visibilityByBatch[b].fill(value)
+      this._syncVisibilityBatch(b)
+    }
+  }
+
+  setInstancesVisibilityByIndices(indices, visible) {
+    if (!Array.isArray(indices) && !(indices instanceof Uint32Array) && !(indices instanceof Int32Array)) return
+    const value = visible ? 1.0 : 0.0
+    const changedBatches = new Set()
+    for (let i = 0; i < indices.length; i++) {
+      const globalIndex = indices[i]
+      if (!Number.isFinite(globalIndex) || globalIndex < 0 || globalIndex >= this._instanceCount) continue
+      const batchIndex = Math.floor(globalIndex / MAX_INSTANCES_PER_DRAW)
+      const localIndex = globalIndex - batchIndex * MAX_INSTANCES_PER_DRAW
+      const batchValues = this._visibilityByBatch[batchIndex]
+      if (!batchValues || localIndex >= batchValues.length) continue
+      batchValues[localIndex] = value
+      changedBatches.add(batchIndex)
+    }
+    changedBatches.forEach((b) => this._syncVisibilityBatch(b))
   }
 
   update(frameState) {
@@ -883,6 +969,13 @@ export class BeiDouGridPrimitive {
     this._geometry = null
     this._batches = []
     this._matrixData = null
+    this._visibilityByBatch = []
+    if (this._visibilityBuffers?.length) {
+      this._visibilityBuffers.forEach((buf) => {
+        try { buf.destroy?.() } catch (e) {}
+      })
+    }
+    this._visibilityBuffers = []
     this._pickReady = false
     this._destroyed = true
   }

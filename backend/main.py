@@ -3,14 +3,32 @@
 FastAPI Hello World
 """
 
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.job_manager import AnalysisJobManager
+from app.models.analysis_models import (
+    CreateAnalysisJobRequest,
+    CreateAnalysisJobResponse,
+    JobResultResponse,
+    JobStatusResponse,
+)
 
 app = FastAPI(
     title="3D GIS 可视域分析系统 API",
     description="后端API服务",
     version="1.0.0"
 )
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+logger = logging.getLogger("backend.api")
+
+job_manager = AnalysisJobManager(max_workers=1)
 
 # 配置CORS
 app.add_middleware(
@@ -40,6 +58,46 @@ async def health_check():
         "status": "healthy",
         "service": "backend-api"
     }
+
+
+@app.post("/api/v1/analysis/jobs", response_model=CreateAnalysisJobResponse)
+async def create_analysis_job(payload: CreateAnalysisJobRequest):
+    if not payload.stations:
+        raise HTTPException(status_code=400, detail="stations cannot be empty")
+    logger.info(
+        "Received analysis request: stations=%d, grid=%dx%dx%d, params(maxDistance=%s, clearance=%s, los=%s-%s, progressBatchCells=%s)",
+        len(payload.stations),
+        payload.gridMeta.gridX,
+        payload.gridMeta.gridY,
+        payload.gridMeta.gridZ,
+        payload.params.maxDistance,
+        payload.params.clearance,
+        payload.params.losSamplesMin,
+        payload.params.losSamplesMax,
+        payload.params.progressBatchCells,
+    )
+    job_id = job_manager.create_job(payload)
+    logger.info("Analysis job created: jobId=%s", job_id)
+    return {
+        "jobId": job_id,
+        "status": "queued",
+    }
+
+
+@app.get("/api/v1/analysis/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_analysis_job_status(job_id: str):
+    status = job_manager.get_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="job not found")
+    return status
+
+
+@app.get("/api/v1/analysis/jobs/{job_id}/result", response_model=JobResultResponse)
+async def get_analysis_job_result(job_id: str):
+    result = job_manager.get_result(job_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="job not found")
+    return result
 
 
 if __name__ == "__main__":
