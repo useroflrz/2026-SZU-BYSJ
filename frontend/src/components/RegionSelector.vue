@@ -77,7 +77,7 @@ import { ElMessage } from 'element-plus'
 import JSZip from 'jszip'
 import { useMapStore } from '../stores/map'
 import {
-  parseShpZipArrayBufferToBounds,
+  parseShpZipArrayBufferToBoundsAndClip,
   looksLikeLonLatBounds
 } from '../utils/shpExtent'
 const mapStore = useMapStore()
@@ -145,7 +145,8 @@ const handleCityChange = (value) => {
     mapStore.setRegion({
       name: regionName.value,
       bounds: bounds.value,
-      area: area.value
+      area: area.value,
+      clipGeoJson: null
     })
     // viewer 就绪时再绘制到地图
     if (mapStore.viewer) mapStore.drawRegion(bounds.value, regionName.value)
@@ -164,7 +165,7 @@ const estimateAreaKm2FromBounds = (b) => {
   const heightM = Math.max(0, (b.maxY - b.minY) * metersPerDegLat)
   return (widthM * heightM) / 1e6
 }
-const setParsedRegion = (parsedBounds, name) => {
+const setParsedRegion = (parsedBounds, name, clipGeoJson = null) => {
   bounds.value = parsedBounds
   regionName.value = name || '导入区域'
   area.value = estimateAreaKm2FromBounds(parsedBounds)
@@ -175,7 +176,8 @@ const setParsedRegion = (parsedBounds, name) => {
   mapStore.setRegion({
     name: regionName.value,
     bounds: bounds.value,
-    area: area.value
+    area: area.value,
+    clipGeoJson
   })
   // viewer 就绪时：绘制到地图，并把镜头移动到该区域
   if (mapStore.viewer) {
@@ -215,12 +217,13 @@ const parseAndApplyShp = async (nameHint = '') => {
       zipArrayBuffer = await z.generateAsync({ type: 'arraybuffer' })
       regionName.value = stem
     }
-    const parsedBounds = await parseShpZipArrayBufferToBounds(zipArrayBuffer)
+    const { bounds: parsedBounds, clipGeoJson } =
+      await parseShpZipArrayBufferToBoundsAndClip(zipArrayBuffer)
     if (!parsedBounds) {
       ElMessage.error('未能从 shp 中解析出有效范围（bbox）')
       return
     }
-    setParsedRegion(parsedBounds, regionName.value || nameHint)
+    setParsedRegion(parsedBounds, regionName.value || nameHint, clipGeoJson)
     ElMessage.success('SHP范围解析成功')
   } catch (e) {
     ElMessage.error(`SHP解析失败：${e?.message || '未知错误'}`)
@@ -272,7 +275,8 @@ const confirmRegion = () => {
   mapStore.setRegion({
     name: regionName.value,
     bounds: bounds.value,
-    area: area.value
+    area: area.value,
+    clipGeoJson: mapStore.selectedRegion?.clipGeoJson ?? null
   })
   // 选定前在地图上保留蓝色矩形预览，点击“确认区域”后移除预览矩形
   mapStore.removeRegionRectangleOnly()

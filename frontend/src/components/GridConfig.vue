@@ -267,8 +267,13 @@ const generateGrid = async () => {
     analysisStore.setGridMeta(mapStore.beiDouGridMeta)
     analysisStore.setPreferredAnalysisMode('grid-viewshed-1_4ghz')
 
+    const bboxHint =
+      typeof primitiveInfo.bboxCellTotal === 'number' &&
+      primitiveInfo.bboxCellTotal > primitiveInfo.total
+        ? `（矩形内共 ${primitiveInfo.bboxCellTotal.toLocaleString()} 体素，区内有效 ${primitiveInfo.total.toLocaleString()}）`
+        : ''
     ElMessage.success(
-      `格网生成完成，共 ${primitiveInfo.total.toLocaleString()} 个格网单元（已贴地：terrain采样，离地高度范围：${form.zMin}~${form.zMax}m）`
+      `格网生成完成，共 ${primitiveInfo.total.toLocaleString()} 个有效格网单元${bboxHint}（已贴地：terrain采样，离地高度范围：${form.zMin}~${form.zMax}m）`
     )
     ElMessage.info('可前往“分析参数”直接运行格网可视域(1.4GHz)分析')
   } catch (e) {

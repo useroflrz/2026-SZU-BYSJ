@@ -9,11 +9,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.job_manager import AnalysisJobManager
+from app.core.mask_job_manager import ColumnMaskJobManager
 from app.models.analysis_models import (
     CreateAnalysisJobRequest,
     CreateAnalysisJobResponse,
     JobResultResponse,
     JobStatusResponse,
+)
+from app.models.grid_mask_models import (
+    ColumnMaskJobRequest,
+    ColumnMaskJobResultResponse,
+    ColumnMaskJobStatusResponse,
+    CreateColumnMaskJobResponse,
 )
 
 app = FastAPI(
@@ -29,6 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("backend.api")
 
 job_manager = AnalysisJobManager(max_workers=1)
+mask_job_manager = ColumnMaskJobManager(max_workers=1)
 
 # 配置CORS
 app.add_middleware(
@@ -95,6 +103,42 @@ async def get_analysis_job_status(job_id: str):
 @app.get("/api/v1/analysis/jobs/{job_id}/result", response_model=JobResultResponse)
 async def get_analysis_job_result(job_id: str):
     result = job_manager.get_result(job_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="job not found")
+    return result
+
+
+@app.post("/api/v1/grid/column-mask/jobs", response_model=CreateColumnMaskJobResponse)
+async def create_column_mask_job(payload: ColumnMaskJobRequest):
+    cells = payload.gridX * payload.gridY
+    logger.info(
+        "HTTP 收到柱掩膜任务: grid=%dx%d 平面格点=%d 裁剪=%s",
+        payload.gridX,
+        payload.gridY,
+        cells,
+        "是" if payload.clipMultiPolygonCoordinates else "否（全柱有效）",
+    )
+    job_id = mask_job_manager.create_job(payload)
+    return {"jobId": job_id, "status": "queued"}
+
+
+@app.get(
+    "/api/v1/grid/column-mask/jobs/{job_id}",
+    response_model=ColumnMaskJobStatusResponse,
+)
+async def get_column_mask_job_status(job_id: str):
+    status = mask_job_manager.get_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="job not found")
+    return status
+
+
+@app.get(
+    "/api/v1/grid/column-mask/jobs/{job_id}/result",
+    response_model=ColumnMaskJobResultResponse,
+)
+async def get_column_mask_job_result(job_id: str):
+    result = mask_job_manager.get_result(job_id)
     if not result:
         raise HTTPException(status_code=404, detail="job not found")
     return result

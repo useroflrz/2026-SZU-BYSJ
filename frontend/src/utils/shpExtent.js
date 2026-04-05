@@ -93,3 +93,60 @@ export async function parseShpZipArrayBufferToBounds(zipArrayBuffer) {
   return geoJsonToBounds(geo)
 }
 
+function pushPolygonGeometries(geometry, out) {
+  if (!geometry) return
+  if (geometry.type === 'Polygon') {
+    out.push(geometry.coordinates)
+    return
+  }
+  if (geometry.type === 'MultiPolygon') {
+    for (const c of geometry.coordinates || []) out.push(c)
+    return
+  }
+  if (geometry.type === 'GeometryCollection' && Array.isArray(geometry.geometries)) {
+    for (const g of geometry.geometries) pushPolygonGeometries(g, out)
+  }
+}
+
+function collectClipPolygonsFromGeoJson(geo, out) {
+  if (!geo) return
+  if (!Array.isArray(geo) && typeof geo === 'object' && geo.type === undefined) {
+    for (const v of Object.values(geo)) collectClipPolygonsFromGeoJson(v, out)
+    return
+  }
+  if (Array.isArray(geo)) {
+    for (const g of geo) collectClipPolygonsFromGeoJson(g, out)
+    return
+  }
+  if (geo.type === 'FeatureCollection' && Array.isArray(geo.features)) {
+    for (const f of geo.features) {
+      if (f.geometry) pushPolygonGeometries(f.geometry, out)
+    }
+    return
+  }
+  if (geo.type === 'Feature' && geo.geometry) {
+    pushPolygonGeometries(geo.geometry, out)
+    return
+  }
+  if (geo.type && geo.coordinates) {
+    pushPolygonGeometries(geo, out)
+  }
+}
+
+/**
+ * 从 shp 解析结果提取 MultiPolygon 坐标（用于柱掩膜），若无面几何则返回 null
+ */
+export function geoJsonToClipMultiPolygon(geo) {
+  const polys = []
+  collectClipPolygonsFromGeoJson(geo, polys)
+  if (polys.length === 0) return null
+  return { type: 'MultiPolygon', coordinates: polys }
+}
+
+export async function parseShpZipArrayBufferToBoundsAndClip(zipArrayBuffer) {
+  const geo = await shp(zipArrayBuffer)
+  const bounds = geoJsonToBounds(geo)
+  const clipGeoJson = geoJsonToClipMultiPolygon(geo)
+  return { bounds, clipGeoJson }
+}
+

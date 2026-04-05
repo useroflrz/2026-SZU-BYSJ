@@ -99,10 +99,10 @@ def run_grid_viewshed_analysis(
     origin_lat = grid_meta.originLat
     default_height = grid_meta.originGroundHeight
 
-    total = grid_x * grid_y * grid_z
+    bbox_cells = grid_x * grid_y * grid_z
     logger.info(
-        "Viewshed compute start: totalCells=%d, grid=%dx%dx%d, stations=%d",
-        total,
+        "Viewshed compute start: bboxCells=%d, grid=%dx%dx%d, stations=%d",
+        bbox_cells,
         grid_x,
         grid_y,
         grid_z,
@@ -114,6 +114,56 @@ def run_grid_viewshed_analysis(
         copy_count = min(padded.size, ground_heights.size)
         padded[:copy_count] = ground_heights[:copy_count]
         ground_heights = padded
+
+    col_n = grid_x * grid_y
+    column_active = np.ones(col_n, dtype=np.bool_)
+    if grid_meta.columnActive is not None:
+        ca = np.asarray(grid_meta.columnActive, dtype=np.float64).reshape(-1)
+        if ca.size == col_n:
+            column_active = ca > 0.5
+
+    active_columns = int(np.sum(column_active))
+    active_cells = active_columns * grid_z
+    column_any_visible = np.zeros(col_n, dtype=np.bool_)
+
+    layer_stats: List[dict] = []
+    for iz in range(grid_z):
+        layer_stats.append(
+            {
+                "layerIndex": iz,
+                "totalPoints": 0,
+                "visiblePoints": 0,
+                "invisiblePoints": 0,
+                "visibilityRatio": 0.0,
+                "zMin": z_min_rel + iz * dz,
+                "zMax": z_min_rel + (iz + 1) * dz,
+            }
+        )
+
+    if active_cells <= 0:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        if on_progress:
+            on_progress(100)
+        return {
+            "total": 0,
+            "gridX": grid_x,
+            "gridY": grid_y,
+            "gridZ": grid_z,
+            "stats": {
+                "totalPoints": 0,
+                "visiblePoints": 0,
+                "invisiblePoints": 0,
+                "visibilityRatio": 0.0,
+                "stationCount": len(stations),
+                "activeColumns": 0,
+                "activeCells": 0,
+                "coveredAreaM2": 0.0,
+                "bboxCells": bbox_cells,
+            },
+            "layerStats": layer_stats,
+            "uncoveredIndices": [],
+            "elapsedMs": elapsed_ms,
+        }
 
     center_lat_rad = math.radians(origin_lat)
     meters_per_deg_lat = 111000.0
@@ -129,20 +179,6 @@ def run_grid_viewshed_analysis(
             }
         )
 
-    layer_stats = []
-    for iz in range(grid_z):
-        layer_stats.append(
-            {
-                "layerIndex": iz,
-                "totalPoints": 0,
-                "visiblePoints": 0,
-                "invisiblePoints": 0,
-                "visibilityRatio": 0.0,
-                "zMin": z_min_rel + iz * dz,
-                "zMax": z_min_rel + (iz + 1) * dz,
-            }
-        )
-
     uncovered_indices: List[int] = []
     visible_count = 0
     processed = 0
@@ -155,6 +191,8 @@ def run_grid_viewshed_analysis(
         for iy in range(grid_y):
             for ix in range(grid_x):
                 col_index = iy * grid_x + ix
+                if not column_active[col_index]:
+                    continue
                 ground_h = float(ground_heights[col_index]) if col_index < ground_heights.size else default_height
                 rx_x = (ix + 0.5) * dx
                 rx_y = (iy + 0.5) * dy
@@ -191,40 +229,50 @@ def run_grid_viewshed_analysis(
                 layer_stats[iz]["totalPoints"] += 1
                 if visible:
                     visible_count += 1
+                    column_any_visible[col_index] = True
                     layer_stats[iz]["visiblePoints"] += 1
                 else:
                     layer_stats[iz]["invisiblePoints"] += 1
                     uncovered_indices.append(global_index)
 
                 processed += 1
-                if on_progress and processed % progress_batch == 0:
-                    on_progress(int(processed * 100 / total))
+                if on_progress and active_cells > 0 and processed % progress_batch == 0:
+                    on_progress(int(processed * 100 / active_cells))
 
     for s in layer_stats:
         tp = s["totalPoints"]
         s["visibilityRatio"] = (s["visiblePoints"] / tp) if tp > 0 else 0.0
 
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    covered_columns = int(np.sum(column_any_visible))
+    covered_area_m2 = float(covered_columns * dx * dy)
+    invisible_count = processed - visible_count
     logger.info(
-        "Viewshed compute finish: processed=%d, visible=%d, invisible=%d, elapsedMs=%.2f",
+        "Viewshed compute finish: activeCells=%d, processed=%d, visible=%d, invisible=%d, elapsedMs=%.2f",
+        active_cells,
         processed,
         visible_count,
-        total - visible_count,
+        invisible_count,
         elapsed_ms,
     )
     if on_progress:
         on_progress(100)
 
     return {
-        "total": total,
+        "total": active_cells,
         "gridX": grid_x,
         "gridY": grid_y,
         "gridZ": grid_z,
         "stats": {
-            "totalPoints": total,
+            "totalPoints": active_cells,
             "visiblePoints": visible_count,
-            "invisiblePoints": total - visible_count,
-            "visibilityRatio": (visible_count / total) if total > 0 else 0.0,
+            "invisiblePoints": invisible_count,
+            "visibilityRatio": (visible_count / active_cells) if active_cells > 0 else 0.0,
+            "stationCount": len(stations),
+            "activeColumns": active_columns,
+            "activeCells": active_cells,
+            "coveredAreaM2": covered_area_m2,
+            "bboxCells": bbox_cells,
         },
         "layerStats": layer_stats,
         "uncoveredIndices": uncovered_indices,

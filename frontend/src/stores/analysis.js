@@ -164,7 +164,11 @@ export const useAnalysisStore = defineStore('analysis', {
           originLon: gridMeta.originLon,
           originLat: gridMeta.originLat,
           originGroundHeight: gridMeta.originGroundHeight ?? 0,
-          groundHeights: await this._toNumberArrayChunked(gridMeta.groundHeights || [])
+          groundHeights: await this._toNumberArrayChunked(gridMeta.groundHeights || []),
+          columnActive:
+            gridMeta.columnActive && gridMeta.columnActive.length === gridMeta.gridX * gridMeta.gridY
+              ? await this._toNumberArrayChunked(gridMeta.columnActive)
+              : undefined
         },
         params: {
           maxDistance: params.maxDistance || 10000,

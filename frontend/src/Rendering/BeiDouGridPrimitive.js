@@ -121,6 +121,12 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
         })()
       : null
 
+  const colActive = options.columnActive
+  const useColMask =
+    colActive &&
+    (colActive.length === gridX * gridY ||
+      (typeof colActive.length === 'number' && colActive.length >= gridX * gridY))
+
   for (let iz = 0; iz < gridZ; iz++) {
     for (let iy = 0; iy < gridY; iy++) {
       for (let ix = 0; ix < gridX; ix++) {
@@ -138,7 +144,10 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
 
         // 退化矩阵：将盒体缩放为 0（不改 shader，实现“不可见”）
         const instanceIndex = iz * gridX * gridY + iy * gridX + ix
-        if (hiddenInstanceFlags && hiddenInstanceFlags[instanceIndex] === 1) {
+        let hide =
+          hiddenInstanceFlags && hiddenInstanceFlags[instanceIndex] === 1
+        if (useColMask && colActive[colIndex] < 0.5) hide = true
+        if (hide) {
           // 注意：Matrix4 的对角线元素对应缩放（Cesium 内部矩阵表示）
           scratchTranslation[0] = 0
           scratchTranslation[5] = 0

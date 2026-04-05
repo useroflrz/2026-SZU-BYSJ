@@ -2,6 +2,12 @@ import { defineStore } from 'pinia'
 import * as Cesium from 'cesium'
 import { markRaw, toRaw } from 'vue'
 import { BeiDouGridPrimitive, createGridInstancesFromBounds } from '../Rendering/BeiDouGridPrimitive'
+import { runColumnMaskJobAndWait } from '../Analysis/apiClient'
+import {
+  buildColumnActiveMask,
+  decodeColumnActiveFloat32B64,
+  simplifyMultiPolygonCoordinates
+} from '../utils/gridColumnClip'
 
 async function sampleGridGroundHeights(viewer, normalizedBounds, originLon, originLat, dx, dy, gridX, gridY, options = {}) {
   const {
@@ -89,6 +95,7 @@ async function sampleGridGroundHeights(viewer, normalizedBounds, originLon, orig
 // 简单的实体/集合管理器，集中存储各类图层的 ids，便于销毁/显隐
 const defaultLayerState = () => ({
   regionEntityId: null,
+  regionClipEntityIds: [],
   stationEntityIds: [],
   resultEntityIds: []
 })
@@ -199,6 +206,19 @@ export const useMapStore = defineStore('map', {
       this.clearAllEntities()
     },
 
+    removeRegionClipEntities() {
+      if (!this.viewer) return
+      const ids = this.layerState.regionClipEntityIds || []
+      for (const id of ids) {
+        try {
+          this.viewer.entities.removeById(id)
+        } catch (e) {
+          // ignore
+        }
+      }
+      this.layerState.regionClipEntityIds = []
+    },
+
     clearAllEntities() {
       if (!this.viewer) return
       this.layerState.stationEntityIds.forEach(id => this.viewer.entities.removeById(id))
@@ -206,6 +226,7 @@ export const useMapStore = defineStore('map', {
       if (this.layerState.regionEntityId) {
         this.viewer.entities.removeById(this.layerState.regionEntityId)
       }
+      this.removeRegionClipEntities()
       this.layerState = defaultLayerState()
       this.clearBeiDouGrid()
     },
@@ -252,8 +273,46 @@ export const useMapStore = defineStore('map', {
       })
       this.layerState.regionEntityId = entity.id
 
-      // 同步写入已选区域参数（供格网/分析联动）
-      this.setRegion({ name, bounds })
+      this.removeRegionClipEntities()
+      const clip = this.selectedRegion?.clipGeoJson
+      if (clip?.type === 'MultiPolygon' && Array.isArray(clip.coordinates)) {
+        const fill = Cesium.Color.fromCssColorString('#67C23A').withAlpha(0.18)
+        const outline = Cesium.Color.fromCssColorString('#67C23A').withAlpha(0.85)
+        for (const poly of clip.coordinates) {
+          const outer = poly && poly[0]
+          if (!outer || outer.length < 3) continue
+          const flat = []
+          for (const pt of outer) {
+            if (Number.isFinite(pt[0]) && Number.isFinite(pt[1])) flat.push(pt[0], pt[1])
+          }
+          if (flat.length < 6) continue
+          const ent = this.viewer.entities.add({
+            name: `${name || '区域'} — 行政边界`,
+            polygon: {
+              hierarchy: new Cesium.PolygonHierarchy(Cesium.Cartesian3.fromDegreesArray(flat)),
+              height: 0,
+              heightReference: Cesium.HeightReference.NONE,
+              material: fill,
+              outline: true,
+              outlineColor: outline
+            }
+          })
+          this.layerState.regionClipEntityIds.push(ent.id)
+        }
+      }
+
+      const bStore = {
+        minX: minLon,
+        minY: minLat,
+        maxX: maxLon,
+        maxY: maxLat
+      }
+      this.setRegion({
+        ...this.selectedRegion,
+        name: name || this.selectedRegion?.name,
+        bounds: bStore,
+        area: this.selectedRegion?.area
+      })
     },
 
     clearRegionLayer() {
@@ -261,6 +320,7 @@ export const useMapStore = defineStore('map', {
         this.viewer.entities.removeById(this.layerState.regionEntityId)
       }
       this.layerState.regionEntityId = null
+      this.removeRegionClipEntities()
       this.selectedRegion = null
     },
 
@@ -455,6 +515,7 @@ export const useMapStore = defineStore('map', {
         outlineColor: '#F56C6C',
         outlineOpacity: Number.isFinite(meta.baseOutlineColor?.alpha) ? meta.baseOutlineColor.alpha : 0.95,
         hiddenInstanceIndices: hiddenIndices,
+        columnActive: meta.columnActive,
         appendMode: true,
         saveAsResultLayer: true
       })
@@ -530,7 +591,82 @@ export const useMapStore = defineStore('map', {
       const gridZ = Math.max(1, Math.ceil((zMax - zMin) / dz))
       const gridX = Math.max(1, Math.ceil(rawWidthM / dx))
       const gridY = Math.max(1, Math.ceil(rawHeightM / dy))
-      const total = gridX * gridY * gridZ
+      const bboxCellTotal = gridX * gridY * gridZ
+
+      const sr = this.selectedRegion
+      const bEq =
+        sr?.bounds &&
+        Math.abs((sr.bounds.minX ?? sr.bounds.minLon) - minLon) < 1e-7 &&
+        Math.abs((sr.bounds.minY ?? sr.bounds.minLat) - minLat) < 1e-7 &&
+        Math.abs((sr.bounds.maxX ?? sr.bounds.maxLon) - maxLon) < 1e-7 &&
+        Math.abs((sr.bounds.maxY ?? sr.bounds.maxLat) - maxLat) < 1e-7
+      const clip = bEq && sr?.clipGeoJson?.type === 'MultiPolygon' ? sr.clipGeoJson : null
+      const rawClipCoords =
+        clip?.coordinates && Array.isArray(clip.coordinates) && clip.coordinates.length
+          ? clip.coordinates
+          : null
+
+      let columnActive
+      if (gridParams.columnActive && gridParams.columnActive.length === gridX * gridY) {
+        columnActive =
+          gridParams.columnActive instanceof Float32Array
+            ? gridParams.columnActive
+            : Float32Array.from(gridParams.columnActive)
+      } else if (rawClipCoords) {
+        try {
+          const maskResult = await runColumnMaskJobAndWait({
+            minLon,
+            minLat,
+            maxLon,
+            maxLat,
+            dx,
+            dy,
+            gridX,
+            gridY,
+            clipMultiPolygonCoordinates: rawClipCoords
+          })
+          columnActive = decodeColumnActiveFloat32B64(maskResult.columnActiveB64)
+          if (columnActive.length !== gridX * gridY) {
+            throw new Error('columnActive length mismatch')
+          }
+        } catch (e) {
+          console.warn('[map] 后端柱掩膜失败，改在前端计算（可能短暂卡顿）', e)
+          const multiCoordsLocal = simplifyMultiPolygonCoordinates(rawClipCoords, 2500)
+          columnActive = buildColumnActiveMask({
+            originLon: minLon,
+            originLat: minLat,
+            gridX,
+            gridY,
+            dx,
+            dy,
+            centerLatDeg,
+            multiPolygonCoordinates: multiCoordsLocal
+          })
+        }
+      } else {
+        columnActive = buildColumnActiveMask({
+          originLon: minLon,
+          originLat: minLat,
+          gridX,
+          gridY,
+          dx,
+          dy,
+          centerLatDeg,
+          multiPolygonCoordinates: null
+        })
+      }
+
+      let activeColumns = 0
+      for (let c = 0; c < columnActive.length; c++) {
+        if (columnActive[c] > 0.5) activeColumns++
+      }
+      const activeCellTotal = activeColumns * gridZ
+      const total = bboxCellTotal
+
+      if (activeColumns === 0) {
+        console.warn('[map] showBeiDouGrid: 当前边界与裁剪多边形下无有效柱（请检查 SHP 与边界是否一致）')
+        return null
+      }
 
       const MAX_GEOMETRY_INSTANCES = 120000
       const useInstancing = total > MAX_GEOMETRY_INSTANCES
@@ -608,9 +744,12 @@ export const useMapStore = defineStore('map', {
 
         const geometryInstances = []
         const outlineGeometryInstances = []
+        const yieldEveryInstances = 2500
+        let instancesSinceYield = 0
         for (let ix = 0; ix < gridX; ix++) {
           for (let iy = 0; iy < gridY; iy++) {
             const colIndex = iy * gridX + ix
+            if (columnActive[colIndex] < 0.5) continue
             const groundH = groundHeights?.[colIndex] ?? originGroundHeight
             for (let iz = 0; iz < gridZ; iz++) {
               const instanceIndex = iz * gridX * gridY + iy * gridX + ix
@@ -649,6 +788,11 @@ export const useMapStore = defineStore('map', {
                 })
               )
               renderedCount++
+              instancesSinceYield++
+              if (instancesSinceYield >= yieldEveryInstances) {
+                instancesSinceYield = 0
+                await new Promise((r) => setTimeout(r, 0))
+              }
             }
           }
         }
@@ -681,6 +825,7 @@ export const useMapStore = defineStore('map', {
         else this.beiDouGridOutlinePrimitive = outlinePrimitive
       } else {
         // ✅ 超大规模：GPU 实例化（单几何 + batches）
+        await new Promise((r) => setTimeout(r, 0))
         const scene = this.viewer.scene
         const gridData = createGridInstancesFromBounds(
           normalizedBounds,
@@ -692,7 +837,8 @@ export const useMapStore = defineStore('map', {
             gridX,
             gridY,
             gridZ,
-            hiddenInstanceIndices
+            hiddenInstanceIndices,
+            columnActive
           }
         )
 
@@ -729,7 +875,7 @@ export const useMapStore = defineStore('map', {
           this.beiDouGridInstancedPrimitives = [primitive]
           this.beiDouGridOutlinePrimitive = null
         }
-        renderedCount = gridData.instanceCount
+        renderedCount = activeCellTotal
       }
 
       if (!saveAsResultLayer) {
@@ -756,6 +902,10 @@ export const useMapStore = defineStore('map', {
           originCartesian,
           originENU,
           groundHeights,
+          columnActive: new Float32Array(columnActive),
+          activeColumns,
+          activeCellTotal,
+          bboxCellTotal,
           fillColor: baseFillColor,
           outlineColor: baseOutlineColor,
           baseFillColor,
@@ -765,10 +915,14 @@ export const useMapStore = defineStore('map', {
       }
 
       const result = {
-        total,
+        total: activeCellTotal,
+        bboxCellTotal,
+        activeColumns,
+        activeCellTotal,
         renderedCount,
         layerCount: gridZ,
-        pointsPerLayer: gridX * gridY,
+        pointsPerLayer: activeColumns,
+        bboxColumns: gridX * gridY,
         capped,
         usedDx: dx,
         usedDy: dy

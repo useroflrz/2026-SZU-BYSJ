@@ -23,6 +23,8 @@ class GridMetaInput(BaseModel):
     originLat: float
     originGroundHeight: float = 0.0
     groundHeights: List[float]
+    # 与 groundHeights 同序 flat 索引 iy*gridX+ix，>0.5 表示参与分析；缺省或长度不符则全柱有效
+    columnActive: Optional[List[float]] = None
 
 
 class AnalysisParamsInput(BaseModel):
