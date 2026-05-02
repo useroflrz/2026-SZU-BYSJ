@@ -15,6 +15,13 @@ export const SIGNAL_STATION_HARD_LIMIT = 1000
 // WebGL 规范保证的每次 instanced draw 最大实例数，超过则分批
 const MAX_INSTANCES_PER_DRAW = 65535
 
+/** GLSL smoothstep 等价，用于线框随屏幕尺度混合 */
+function smoothStep(edge0, edge1, x) {
+  const denom = Math.max(edge1 - edge0, 1e-9)
+  const t = Cesium.Math.clamp((x - edge0) / denom, 0.0, 1.0)
+  return t * t * (3.0 - 2.0 * t)
+}
+
 const scratchTranslation = new Cesium.Matrix4()
 const scratchInstanceMatrix = new Cesium.Matrix4()
 
@@ -265,6 +272,7 @@ uniform vec3 u_halfSize;
 uniform float u_wireframeShow;
 uniform float u_wireframeEdgeRatio;
 uniform float u_lineWidthPx;
+uniform float u_outlineMix;
 varying vec3 v_localPos;
 varying float v_instanceVisible;
 varying vec3 v_worldCenter;
@@ -349,7 +357,8 @@ void main() {
     vec3 col = mix(vec3(0.96, 0.35, 0.35), vec3(0.22, 0.78, 0.36), tMap);
     baseFill = vec4(col, clamp(u_signalAlpha, 0.0, 1.0));
   }
-  vec4 mixedColor = mix(baseFill, u_outlineColor, edgeMask);
+  float outlineW = clamp(u_outlineMix, 0.0, 1.0);
+  vec4 mixedColor = mix(baseFill, u_outlineColor, edgeMask * outlineW);
   gl_FragColor = mixedColor;
 }
 `
@@ -493,6 +502,8 @@ export class BeiDouGridPrimitive {
     for (let i = 0; i < SIGNAL_STATION_HARD_LIMIT; i++) {
       this._signalUniformStations[i] = new Cesium.Cartesian3(0.0, 0.0, 0.0)
     }
+    /** 线框在 mix 中的权重上限，每帧由屏幕尺度更新 */
+    this._outlineMix = 1.0
   }
 
   get isDestroyed() {
@@ -513,6 +524,20 @@ export class BeiDouGridPrimitive {
     }
     if (Number.isFinite(style.lineWidthPx)) {
       this._wireframe.lineWidthPx = Cesium.Math.clamp(style.lineWidthPx, 0.5, 8.0)
+    }
+    if (typeof style.outlineScreenFadeEnabled === 'boolean') {
+      this._wireframe.outlineScreenFadeEnabled = style.outlineScreenFadeEnabled
+    }
+    if (Number.isFinite(style.outlineScreenPxMin)) {
+      this._wireframe.outlineScreenPxMin = Math.max(1.0, style.outlineScreenPxMin)
+    }
+    if (Number.isFinite(style.outlineScreenPxMax)) {
+      this._wireframe.outlineScreenPxMax = Math.max(1.0, style.outlineScreenPxMax)
+    }
+    const wMin = this._wireframe.outlineScreenPxMin
+    const wMax = this._wireframe.outlineScreenPxMax
+    if (Number.isFinite(wMin) && Number.isFinite(wMax) && wMin >= wMax) {
+      this._wireframe.outlineScreenPxMax = wMin + 1.0
     }
   }
 
@@ -828,6 +853,10 @@ export class BeiDouGridPrimitive {
         const w = this._wireframe?.lineWidthPx
         return Number.isFinite(w) ? Cesium.Math.clamp(w, 0.5, 8.0) : lineWidthPxDefault
       },
+      u_outlineMix: () => {
+        const m = this._outlineMix
+        return Number.isFinite(m) ? Cesium.Math.clamp(m, 0.0, 1.0) : 1.0
+      },
       u_signalMode: () => {
         return this._signal?.enabled ? 1.0 : 0.0
       },
@@ -1037,6 +1066,65 @@ export class BeiDouGridPrimitive {
     changedBatches.forEach((b) => this._syncVisibilityBatch(b))
   }
 
+  /**
+   * 按典型格元在屏幕上的近似像素宽度调制线框 mix，缓解密格「屏上密纹」。
+   * @param {*} frameState - Cesium FrameState
+   */
+  _updateOutlineMixForScreenScale(frameState) {
+    const wf = this._wireframe
+    if (wf?.outlineScreenFadeEnabled === false) {
+      this._outlineMix = 1.0
+      return
+    }
+    this._ensureBoundingSphere()
+    const sphere = this._boundingSphere
+    const camera = frameState.camera
+    const context = frameState.context
+    if (!sphere || !camera || !context) {
+      this._outlineMix = 1.0
+      return
+    }
+    const frustum = camera.frustum
+    if (!(frustum instanceof Cesium.PerspectiveFrustum)) {
+      this._outlineMix = 1.0
+      return
+    }
+    const fovy = frustum.fovy
+    if (!Number.isFinite(fovy) || fovy <= 0.0) {
+      this._outlineMix = 1.0
+      return
+    }
+    const canvasHeight = context.drawingBufferHeight
+    if (!Number.isFinite(canvasHeight) || canvasHeight <= 0.0) {
+      this._outlineMix = 1.0
+      return
+    }
+    const dist = Math.max(
+      Cesium.Cartesian3.distance(camera.positionWC, sphere.center),
+      1.0
+    )
+    const tanHalf = Math.tan(fovy * 0.5)
+    if (!Number.isFinite(tanHalf) || tanHalf <= 1e-12) {
+      this._outlineMix = 1.0
+      return
+    }
+    const pixelsPerMeter = canvasHeight * 0.5 / (dist * tanHalf)
+    const half = wf?.halfSize
+    let cellSizeM = 1.0
+    if (half instanceof Cesium.Cartesian3) {
+      cellSizeM = 2.0 * Math.max(Math.abs(half.x), Math.abs(half.y))
+    }
+    if (!Number.isFinite(cellSizeM) || cellSizeM <= 0.0) {
+      cellSizeM = 1.0
+    }
+    const cellPx = cellSizeM * pixelsPerMeter
+    let pxMin = Number.isFinite(wf?.outlineScreenPxMin) ? wf.outlineScreenPxMin : 10.0
+    let pxMax = Number.isFinite(wf?.outlineScreenPxMax) ? wf.outlineScreenPxMax : 32.0
+    pxMin = Math.max(1.0, pxMin)
+    pxMax = Math.max(pxMin + 1.0, pxMax)
+    this._outlineMix = smoothStep(pxMin, pxMax, cellPx)
+  }
+
   update(frameState) {
     if (this._destroyed || !this.show) return
     if (!frameState.passes.render) return
@@ -1050,6 +1138,8 @@ export class BeiDouGridPrimitive {
       this._buildResources(context)
     }
     if (!this._ready || !this._commandList.length) return
+
+    this._updateOutlineMixForScreenScale(frameState)
 
     const commandList = frameState.commandList
     for (let i = 0; i < this._commandList.length; i++) {

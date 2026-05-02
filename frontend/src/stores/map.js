@@ -1369,7 +1369,10 @@ export const useMapStore = defineStore('map', {
               halfSize: new Cesium.Cartesian3(halfWidth, halfLength, halfHeight),
               edgeRatio: 0.01,
               lineWidthPx: 1.25,
-              visibleDistance: 1e9
+              visibleDistance: 1e9,
+              outlineScreenFadeEnabled: true,
+              outlineScreenPxMin: 10,
+              outlineScreenPxMax: 32
             },
             debug: import.meta.env?.DEV
           }
