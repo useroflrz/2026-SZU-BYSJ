@@ -1,0 +1,11 @@
+figure,required_asset,status,notes
+fig1,fig1-left-system.png,pending,同视角同分辨率
+fig1,fig1-right-traditional.png,pending,传统分离链路
+fig1,fig1-boundary-compare.psd,pending,含放大框和像素标尺
+fig8,fig8-main-cesium.png,pending,南山区主图
+fig8,fig8-inset-shenzhen.png,pending,深圳定位小图
+fig8,fig8-region-sites.png,pending,最终合成图
+fig9,fig9-main-3d.png,pending,红绿可视域主图
+fig9,fig9-inset-cone.png,pending,站点视线锥
+fig9,fig9-inset-panel.png,pending,统计面板
+fig9,fig9-viewshed-compose.png,pending,最终合成图

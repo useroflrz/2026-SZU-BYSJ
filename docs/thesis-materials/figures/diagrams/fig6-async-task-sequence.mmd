@@ -1,0 +1,28 @@
+sequenceDiagram
+    participant ui as 前端UI
+    participant api as API网关
+    participant queue as 任务队列
+    participant engine as 计算引擎
+    participant store as 内存状态存储
+
+    ui->>api: POST /analysis/jobs (参数)
+    api->>queue: 入队(job)
+    queue-->>api: task_id
+    api-->>ui: 202 + task_id
+
+    loop 每500ms（非阻塞轮询）
+        ui->>api: GET /analysis/jobs/{task_id}/status
+        api->>store: 读取 status/progress
+        store-->>api: {status:"running", progress:45%}
+        api-->>ui: 返回状态
+    end
+
+    queue->>engine: 分发(task_id)
+    engine->>store: 更新进度
+    engine-->>store: 写入 done + resultIndex
+
+    ui->>api: GET /analysis/jobs/{task_id}/result
+    api->>store: 读取 resultIndex
+    store-->>api: 返回结果数据
+    api-->>ui: 紧凑结果载荷
+    ui->>ui: 重建渲染图层

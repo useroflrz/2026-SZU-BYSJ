@@ -67,3 +67,25 @@ export async function runColumnMaskJobAndWait(payload, pollMs = 300) {
   }
   return resultResp.result
 }
+
+export async function sampleLocalDemGrid(payload, demFile) {
+  if (!demFile) {
+    throw new Error('DEM tif 文件未选择')
+  }
+  const formData = new FormData()
+  formData.append('demFile', demFile)
+  Object.entries(payload || {}).forEach(([k, v]) => {
+    if (v === null || v === undefined) return
+    formData.append(k, String(v))
+  })
+
+  const response = await fetch(`${BASE_URL}/api/v1/grid/local-dem/sample`, {
+    method: 'POST',
+    body: formData
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(`HTTP ${response.status}: ${text || response.statusText}`)
+  }
+  return response.json()
+}

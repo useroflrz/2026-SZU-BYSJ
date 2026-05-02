@@ -1,0 +1,16 @@
+flowchart LR
+    inputVector["输入A: 矢量边界"] --> maskService["掩膜判定服务"]
+    inputCenters["输入B: 格柱中心点集"] --> maskService
+    inputCenters --> terrainSample["Cesium地形采样"]
+
+    maskService --> sharedData["共享同源结构\n{columnMask:boolean[], groundHeights:number[]}"]
+    terrainSample --> sharedData
+
+    sharedData --> renderPipeline["渲染管线读取"]
+    sharedData --> losEngine["LOS算法读取"]
+
+    renderPipeline --> resultA["可视化边界"]
+    losEngine --> resultB["计算边界"]
+
+    resultA --> aligned["同源一致\n0像素偏移"]
+    resultB --> aligned

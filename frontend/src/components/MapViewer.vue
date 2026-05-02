@@ -98,6 +98,10 @@ onMounted(async () => {
     // ignore
   }
 
+  // 地形轻微垂直夸张（相对椭球 0m：高处上抬、低处下压）；仅影响地形网格，贴地 primitive 可能略有视觉偏差
+  viewer.scene.globe.terrainExaggeration = 2.0
+  viewer.scene.globe.terrainExaggerationRelativeHeight = 0
+
   // 设置初始视角（深圳）
   viewer.camera.setView({
     destination: Cesium.Cartesian3.fromDegrees(114.0579, 22.5431, 5000)

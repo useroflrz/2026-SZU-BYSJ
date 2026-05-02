@@ -4,8 +4,9 @@ FastAPI Hello World
 """
 
 import logging
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.job_manager import AnalysisJobManager
@@ -22,6 +23,8 @@ from app.models.grid_mask_models import (
     ColumnMaskJobStatusResponse,
     CreateColumnMaskJobResponse,
 )
+from app.models.local_dem_models import LocalDemSampleResponse
+from app.core.local_dem_engine import sample_local_dem_grid
 
 app = FastAPI(
     title="3D GIS 可视域分析系统 API",
@@ -141,6 +144,48 @@ async def get_column_mask_job_result(job_id: str):
     result = mask_job_manager.get_result(job_id)
     if not result:
         raise HTTPException(status_code=404, detail="job not found")
+    return result
+
+
+@app.post("/api/v1/grid/local-dem/sample", response_model=LocalDemSampleResponse)
+async def sample_local_dem(
+    demFile: UploadFile = File(...),
+    minLon: float = Form(...),
+    minLat: float = Form(...),
+    maxLon: float = Form(...),
+    maxLat: float = Form(...),
+    originLon: float = Form(...),
+    originLat: float = Form(...),
+    dx: float = Form(...),
+    dy: float = Form(...),
+    gridX: int = Form(...),
+    gridY: int = Form(...),
+    defaultHeight: float = Form(0.0),
+    columnActiveB64: Optional[str] = Form(None),
+):
+    del minLon, minLat, maxLon, maxLat  # 预留参数，便于后续做边界校验日志
+    if not demFile.filename:
+        raise HTTPException(status_code=400, detail="DEM 文件为空")
+    dem_bytes = await demFile.read()
+    if not dem_bytes:
+        raise HTTPException(status_code=400, detail="DEM 文件内容为空")
+    try:
+        result = sample_local_dem_grid(
+            dem_bytes=dem_bytes,
+            origin_lon=originLon,
+            origin_lat=originLat,
+            dx=dx,
+            dy=dy,
+            grid_x=gridX,
+            grid_y=gridY,
+            default_height=defaultHeight,
+            column_active_b64=columnActiveB64,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("local dem sample failed: %s", exc)
+        raise HTTPException(status_code=500, detail="后端 DEM 采样失败")
     return result
 
 

@@ -1,0 +1,40 @@
+flowchart LR
+    subgraph appLayer [应用层]
+        appUI["Vue3 前端界面\n区域配置/参数设置/结果展示"]
+        appState["Pinia 状态管理"]
+        appRender["Cesium 1.99.0 渲染与交互"]
+    end
+
+    subgraph serviceLayer [服务层]
+        apiGateway["FastAPI API 网关"]
+        maskService["掩膜生成服务"]
+        viewshedService["通视计算服务"]
+        statusService["任务状态查询"]
+        runtimeServer["Uvicorn 运行时"]
+    end
+
+    subgraph dataLayer [数据层]
+        vectorData["矢量边界数据"]
+        terrainData["地形高程数据"]
+        gridParams["格网参数"]
+        resultCache["结果缓存/内存状态"]
+    end
+
+    userInput["用户输入"] --> appUI
+    appUI --> appState
+    appState --> appRender
+    appState --> apiGateway
+
+    apiGateway --> maskService
+    apiGateway --> viewshedService
+    apiGateway --> statusService
+    runtimeServer --> apiGateway
+
+    vectorData --> maskService
+    terrainData --> viewshedService
+    gridParams --> viewshedService
+    viewshedService --> resultCache
+    statusService --> resultCache
+
+    maskService --> appRender
+    viewshedService --> appRender

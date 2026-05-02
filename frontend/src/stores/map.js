@@ -1,18 +1,31 @@
 import { defineStore } from 'pinia'
 import * as Cesium from 'cesium'
 import { markRaw, toRaw } from 'vue'
-import { BeiDouGridPrimitive, createGridInstancesFromBounds } from '../Rendering/BeiDouGridPrimitive'
-import { runColumnMaskJobAndWait } from '../Analysis/apiClient'
+import { BeiDouGridPrimitive, createGridInstancesFromBounds, SIGNAL_STATION_HARD_LIMIT } from '../Rendering/BeiDouGridPrimitive'
+import { runColumnMaskJobAndWait, sampleLocalDemGrid } from '../Analysis/apiClient'
 import {
   buildColumnActiveMask,
   decodeColumnActiveFloat32B64,
   simplifyMultiPolygonCoordinates
 } from '../utils/gridColumnClip'
 
+/** 与 Cesium.Globe#terrainExaggeration / terrainExaggerationRelativeHeight 一致（椭球高程，米） */
+function applyGlobeTerrainExaggerationToHeightMeters(heightMeters, globe) {
+  if (!Number.isFinite(heightMeters)) return heightMeters
+  if (!globe) return heightMeters
+  const R = Number.isFinite(globe.terrainExaggerationRelativeHeight)
+    ? globe.terrainExaggerationRelativeHeight
+    : 0
+  const E = Number.isFinite(globe.terrainExaggeration) ? globe.terrainExaggeration : 1
+  return R + E * (heightMeters - R)
+}
+
 async function sampleGridGroundHeights(viewer, normalizedBounds, originLon, originLat, dx, dy, gridX, gridY, options = {}) {
   const {
-    batchSize = 200,
-    defaultHeight = 0
+    batchSize = 500,
+    defaultHeight = 0,
+    columnActive = null,
+    onProgress = null
   } = options
 
   // Cesium 在某些 Vue3 情况下，若 viewer 是响应式 Proxy，会在 tile availability 计算阶段触发渲染停止错误。
@@ -20,9 +33,15 @@ async function sampleGridGroundHeights(viewer, normalizedBounds, originLon, orig
   const rawViewer = toRaw(viewer)
   const terrainProvider = rawViewer?.terrainProvider
   const groundHeights = new Float32Array(gridX * gridY)
+  groundHeights.fill(defaultHeight)
+
+  const report = (current, total) => {
+    if (typeof onProgress === 'function' && total > 0) {
+      onProgress({ current, total })
+    }
+  }
 
   if (!terrainProvider || gridX <= 0 || gridY <= 0) {
-    groundHeights.fill(defaultHeight)
     return { originGroundHeight: defaultHeight, groundHeights }
   }
 
@@ -55,26 +74,37 @@ async function sampleGridGroundHeights(viewer, normalizedBounds, originLon, orig
     originGroundHeight = defaultHeight
   }
 
-  // 按 (ix,iy) 的柱中心点采样地形高度（gridZ 层不参与采样，避免乘法爆炸）
+  // 按 (ix,iy) 的柱中心点采样地形高度（gridZ 层不参与采样，避免乘法爆炸）。
+  // 若提供 columnActive，仅对有效柱采样，显著减少 SHP 裁剪后大 bbox 下的瓦片请求次数。
   const totalCols = gridX * gridY
-  for (let start = 0; start < totalCols; start += batchSize) {
-    const end = Math.min(totalCols, start + batchSize)
-    const cartos = []
-    const idxs = []
+  let activeLinear = null
+  if (columnActive && columnActive.length === gridX * gridY) {
+    let n = 0
+    for (let i = 0; i < totalCols; i++) {
+      if (columnActive[i] > 0.5) n++
+    }
+    activeLinear = new Uint32Array(n)
+    let w = 0
+    for (let i = 0; i < totalCols; i++) {
+      if (columnActive[i] > 0.5) activeLinear[w++] = i
+    }
+  }
+  const toSampleCount = activeLinear ? activeLinear.length : totalCols
+  let sampledSoFar = 0
 
-    for (let linear = start; linear < end; linear++) {
+  const sampleBatch = async (idxs) => {
+    if (idxs.length === 0) return
+    const cartos = []
+    for (let b = 0; b < idxs.length; b++) {
+      const linear = idxs[b]
       const ix = linear % gridX
       const iy = Math.floor(linear / gridX)
-
       const localX = (ix + 0.5) * dx
       const localY = (iy + 0.5) * dy
       const lon = originLon + localX / safeMetersPerDegLon
       const lat = originLat + localY / metersPerDegLat
-
       cartos.push(Cesium.Cartographic.fromDegrees(lon, lat))
-      idxs.push(linear)
     }
-
     try {
       await safeSample(cartos)
       for (let j = 0; j < cartos.length; j++) {
@@ -82,14 +112,96 @@ async function sampleGridGroundHeights(viewer, normalizedBounds, originLon, orig
         groundHeights[idxs[j]] = Number.isFinite(h) ? h : defaultHeight
       }
     } catch (e) {
-      // 采样批失败时，回退这批柱为默认高度，保证功能可用
-      for (let linear = start; linear < end; linear++) {
-        groundHeights[linear] = defaultHeight
+      for (let b = 0; b < idxs.length; b++) {
+        groundHeights[idxs[b]] = defaultHeight
       }
+    }
+    sampledSoFar += idxs.length
+    report(sampledSoFar, toSampleCount)
+  }
+
+  if (activeLinear) {
+    for (let start = 0; start < activeLinear.length; start += batchSize) {
+      const end = Math.min(activeLinear.length, start + batchSize)
+      await sampleBatch(activeLinear.subarray(start, end))
+    }
+  } else {
+    for (let start = 0; start < totalCols; start += batchSize) {
+      const end = Math.min(totalCols, start + batchSize)
+      const idxs = new Uint32Array(end - start)
+      for (let k = 0, linear = start; linear < end; linear++, k++) {
+        idxs[k] = linear
+      }
+      await sampleBatch(idxs)
     }
   }
 
   return { originGroundHeight, groundHeights }
+}
+
+async function sampleGridGroundHeightsFromLocalDem(
+  demFile,
+  normalizedBounds,
+  originLon,
+  originLat,
+  dx,
+  dy,
+  gridX,
+  gridY,
+  options = {}
+) {
+  const { defaultHeight = 0, columnActive = null, onProgress = null } = options
+  if (!demFile) {
+    throw new Error('本地DEM文件未选择')
+  }
+  const encodeFloat32ToB64 = (arr) => {
+    if (!(arr instanceof Float32Array)) return null
+    const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength)
+    let binary = ''
+    const CHUNK = 0x8000
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      const sub = bytes.subarray(i, Math.min(bytes.length, i + CHUNK))
+      binary += String.fromCharCode(...sub)
+    }
+    return btoa(binary)
+  }
+  const decodeFloat32B64 = (b64) => {
+    const bin = atob(b64 || '')
+    const buf = new ArrayBuffer(bin.length)
+    const view = new Uint8Array(buf)
+    for (let i = 0; i < bin.length; i++) {
+      view[i] = bin.charCodeAt(i)
+    }
+    return new Float32Array(buf)
+  }
+
+  const payload = {
+    minLon: normalizedBounds.minLon,
+    minLat: normalizedBounds.minLat,
+    maxLon: normalizedBounds.maxLon,
+    maxLat: normalizedBounds.maxLat,
+    originLon,
+    originLat,
+    dx,
+    dy,
+    gridX,
+    gridY,
+    defaultHeight,
+    columnActiveB64: columnActive ? encodeFloat32ToB64(columnActive) : null
+  }
+  const resp = await sampleLocalDemGrid(payload, demFile)
+  const groundHeights = decodeFloat32B64(resp.groundHeightsB64)
+  if (groundHeights.length !== gridX * gridY) {
+    throw new Error('后端返回的DEM高程数组长度不匹配')
+  }
+  if (typeof onProgress === 'function') {
+    onProgress({ current: resp.sampledColumns ?? groundHeights.length, total: resp.totalColumns ?? groundHeights.length })
+  }
+  const originHeight = Number(resp.originGroundHeight)
+  return {
+    originGroundHeight: Number.isFinite(originHeight) ? originHeight : defaultHeight,
+    groundHeights
+  }
 }
 
 // 简单的实体/集合管理器，集中存储各类图层的 ids，便于销毁/显隐
@@ -99,6 +211,46 @@ const defaultLayerState = () => ({
   stationEntityIds: [],
   resultEntityIds: []
 })
+
+function normalizeBounds(bounds) {
+  const b = bounds || {}
+  const minLon = b.minX ?? b.minLon
+  const minLat = b.minY ?? b.minLat
+  const maxLon = b.maxX ?? b.maxLon
+  const maxLat = b.maxY ?? b.maxLat
+  if (![minLon, minLat, maxLon, maxLat].every(Number.isFinite)) return null
+  return { minLon, minLat, maxLon, maxLat }
+}
+
+function hashClipCoordinates(coords) {
+  if (!coords || !Array.isArray(coords) || coords.length === 0) return 'no-clip'
+  let h = 2166136261 >>> 0 // FNV-1a basis
+  let samples = 0
+  const maxSamples = 5000
+  const mix = (n) => {
+    const x = (n * 1e6) | 0
+    h ^= x >>> 0
+    h = Math.imul(h, 16777619) >>> 0
+  }
+  // coords: MultiPolygon -> [ [ [ [lon,lat], ... ] ] , ... ]
+  for (let p = 0; p < coords.length && samples < maxSamples; p++) {
+    const poly = coords[p]
+    if (!poly || !Array.isArray(poly) || poly.length === 0) continue
+    const ring = poly[0]
+    if (!ring || !Array.isArray(ring)) continue
+    for (let i = 0; i < ring.length && samples < maxSamples; i++) {
+      const pt = ring[i]
+      if (!pt || pt.length < 2) continue
+      const lon = pt[0]
+      const lat = pt[1]
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue
+      mix(lon)
+      mix(lat)
+      samples++
+    }
+  }
+  return `clip-${h.toString(16)}-${samples}`
+}
 
 export const useMapStore = defineStore('map', {
   state: () => ({
@@ -121,7 +273,13 @@ export const useMapStore = defineStore('map', {
     // instanced 模式下的选中格子高亮：使用官方 Primitive + GeometryInstance
     beiDouGridSelectedPrimitive: null,
     selectedBeiDouCellId: null,
-    selectedBeiDouCellInfo: null
+    selectedBeiDouCellInfo: null,
+    // 信号强度模拟图层（独立于北斗格网/分析结果）
+    signalStrengthLayer: null,
+    // 格网“数据集”缓存：同一 bounds + dx/dy/dz + zMin/zMax + clip 下复用后端掩膜与地形采样结果
+    beiDouGridDatasetCache: markRaw(new Map()),
+    localDemFile: null,
+    localDemVersion: 0
   }),
 
   getters: {
@@ -174,6 +332,178 @@ export const useMapStore = defineStore('map', {
     setViewer(viewer) {
       // markRaw 避免把 Cesium Viewer 包进 Vue 响应式系统（可减少/避免异步 tile 计算的竞态问题）。
       this.viewer = markRaw(viewer)
+    },
+
+    setLocalDemFile(file) {
+      this.localDemFile = markRaw(file || null)
+      this.localDemVersion += 1
+    },
+
+    clearLocalDemFile() {
+      this.localDemFile = null
+      this.localDemVersion += 1
+    },
+
+    _getSignalTargetPrimitive() {
+      const p = this.beiDouGridPrimitive
+      if (p && typeof p.setSignalParams === 'function') return p
+      return null
+    },
+
+    clearSignalStrengthGrid() {
+      const p = this._getSignalTargetPrimitive()
+      if (p) {
+        p.setSignalParams({ enabled: false })
+      }
+      this.signalStrengthLayer = null
+      try {
+        if (this.viewer?.scene?.requestRender) this.viewer.scene.requestRender()
+      } catch (e) {
+        // ignore
+      }
+    },
+
+    setSignalStrengthVisibility(show) {
+      const layer = this.signalStrengthLayer
+      if (!layer) return
+      const p = this._getSignalTargetPrimitive()
+      if (!p) {
+        layer.show = !!show
+        return
+      }
+      try {
+        p.show = true
+      } catch (e) {
+        // ignore
+      }
+      if (show) {
+        const cachedParams = layer.signalParams || {}
+        p.setSignalParams({
+          ...cachedParams,
+          enabled: true
+        })
+      } else {
+        p.setSignalParams({ enabled: false })
+      }
+      layer.show = !!show
+      try {
+        if (this.viewer?.scene?.requestRender) this.viewer.scene.requestRender()
+      } catch (e) {
+        // ignore
+      }
+    },
+
+    async showSignalStrengthGrid(params = {}) {
+      if (!this.viewer) throw new Error('viewer 未初始化')
+      if (!this.beiDouGridMeta) {
+        throw new Error('请先在“格网配置”中生成格网')
+      }
+
+      const stationsRaw = Array.isArray(params.stations) ? params.stations : []
+      if (stationsRaw.length === 0) throw new Error('未提供基站')
+      const freqMHz = Number(params.freqMHz)
+      if (!Number.isFinite(freqMHz) || freqMHz <= 0) throw new Error('频率无效')
+      const opacity = Number(params.opacity)
+      if (!Number.isFinite(opacity) || opacity <= 0) throw new Error('透明度无效')
+      const requestedMaxStations = Math.floor(Number(params.maxStations))
+      const stationCountUpperBound = stationsRaw.length
+      const maxStations = Math.max(
+        1,
+        Math.min(
+          SIGNAL_STATION_HARD_LIMIT,
+          stationCountUpperBound,
+          Number.isFinite(requestedMaxStations) ? requestedMaxStations : stationCountUpperBound
+        )
+      )
+
+      // 若当前是 geometryInstances 模式，复用当前参数重建为 instanced（仍是“格网配置”的同一套格网）
+      if (!this._getSignalTargetPrimitive()) {
+        const meta = this.beiDouGridMeta
+        await this.showBeiDouGrid(meta.bounds, {
+          dx: meta.dx,
+          dy: meta.dy,
+          dz: meta.dz,
+          zMin: meta.zMin,
+          zMax: meta.zMax,
+          fillColor: '#67C23A',
+          fillOpacity: meta.baseFillColor?.alpha ?? 0.05,
+          outlineColor: '#000000',
+          outlineOpacity: meta.baseOutlineColor?.alpha ?? 0.95,
+          columnActive: meta.columnActive,
+          renderModeOverride: 'instanced',
+          elevationMode: meta.elevationMode || 'terrain'
+        })
+      }
+
+      const primitive = this._getSignalTargetPrimitive()
+      if (!primitive) throw new Error('当前格网不支持信号着色')
+
+      const stations = stationsRaw
+        .map((s) => ({
+          lon: Number(s.lon ?? s.position?.lon),
+          lat: Number(s.lat ?? s.position?.lat),
+          height: Number(s.height ?? s.position?.height ?? 0)
+        }))
+        .filter((s) => Number.isFinite(s.lon) && Number.isFinite(s.lat) && Number.isFinite(s.height))
+      if (stations.length === 0) throw new Error('基站坐标无效')
+
+      const stationCart = []
+      for (let i = 0; i < stations.length && stationCart.length < maxStations; i++) {
+        const s = stations[i]
+        stationCart.push(Cesium.Cartesian3.fromDegrees(s.lon, s.lat, s.height))
+      }
+
+      const m = this.beiDouGridMeta
+      const gridDiagM = Math.sqrt(
+        (m.gridX * m.dx) ** 2 +
+        (m.gridY * m.dy) ** 2 +
+        (m.gridZ * m.dz) ** 2
+      )
+      const maxDistM = Number.isFinite(params.radiusM) && params.radiusM > 0
+        ? params.radiusM
+        : Math.max(100.0, gridDiagM)
+
+      const signalGamma = Number(params.signalGamma)
+      const signalBands = Number(params.signalBands)
+      const eirpDbm = Number(params.eirpDbm)
+      const rxGainDbi = Number(params.rxGainDbi)
+      const miscLossDb = Number(params.miscLossDb)
+
+      const minDistMRaw = Number(params.minDistM)
+      let resolvedMinDistM = Number.isFinite(minDistMRaw) ? Math.max(10.0, minDistMRaw) : 120.0
+      if (resolvedMinDistM >= maxDistM) {
+        resolvedMinDistM = Math.max(10.0, maxDistM * 0.15)
+      }
+      const signalParams = {
+        enabled: true,
+        freqMHz,
+        minDistM: resolvedMinDistM,
+        maxDistM,
+        alpha: opacity,
+        signalGamma: Number.isFinite(signalGamma) ? signalGamma : 0.4,
+        signalBands: Number.isFinite(signalBands) ? signalBands : 0.0,
+        eirpDbm: Number.isFinite(eirpDbm) ? eirpDbm : 43.0,
+        rxGainDbi: Number.isFinite(rxGainDbi) ? rxGainDbi : 0.0,
+        miscLossDb: Number.isFinite(miscLossDb) ? miscLossDb : 0.0,
+        stationsEcef: stationCart
+      }
+      primitive.setSignalParams(signalParams)
+
+      this.signalStrengthLayer = markRaw({
+        type: 'signal-strength',
+        show: true,
+        source: 'beidou-existing-grid',
+        freqMHz,
+        stationCount: stationCart.length,
+        requestedMaxStations: maxStations,
+        signalParams
+      })
+      try {
+        if (this.viewer?.scene?.requestRender) this.viewer.scene.requestRender()
+      } catch (e) {
+        // ignore
+      }
+      return this.signalStrengthLayer
     },
 
     setCenter(lon, lat) {
@@ -356,7 +686,7 @@ export const useMapStore = defineStore('map', {
           ),
           billboard: {
             image: 'https://unpkg.com/ionicons@5.5.2/dist/svg/radio-outline.svg',
-            scale: 0.5,
+            scale: 0.3,
             color: Cesium.Color.fromCssColorString('#409EFF'),
             heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND
           },
@@ -429,15 +759,15 @@ export const useMapStore = defineStore('map', {
     clearBeiDouResultGrid() {
       if (!this.viewer) return
       const removePrimitiveSafe = (primitive) => {
-        if (!primitive) return
+        const rawPrimitive = toRaw(primitive)
+        if (!rawPrimitive) return
         try {
-          const inScene = this.viewer.scene?.primitives?.contains?.(primitive) === true
-          if (inScene) {
-            this.viewer.scene.primitives.remove(primitive)
-            return
-          }
-          if (typeof primitive.isDestroyed === 'function' && !primitive.isDestroyed()) {
-            this.schedulePrimitiveDestroy(primitive)
+          const primitives = this.viewer.scene?.primitives
+          // 先直接尝试从集合移除，避免 contains 在部分对象/版本下不可靠造成漏删。
+          const removed = !!primitives?.remove?.(rawPrimitive)
+          if (removed) return
+          if (typeof rawPrimitive.isDestroyed === 'function' && !rawPrimitive.isDestroyed()) {
+            this.schedulePrimitiveDestroy(rawPrimitive)
           }
         } catch (e) {
           // ignore
@@ -489,7 +819,6 @@ export const useMapStore = defineStore('map', {
 
       this.beiDouLastCompactResult = compactResult
 
-      const uncoveredColor = Cesium.Color.fromCssColorString('#F56C6C').withAlpha(0.95)
       const hiddenIndices = []
       for (let idx = 0; idx < totalCells; idx++) {
         if (!hiddenSet.has(idx)) hiddenIndices.push(idx)
@@ -511,9 +840,9 @@ export const useMapStore = defineStore('map', {
         zMin: meta.zMin,
         zMax: meta.zMax,
         fillColor: '#F56C6C',
-        fillOpacity: 0.95,
+        fillOpacity: 0.05,
         outlineColor: '#F56C6C',
-        outlineOpacity: Number.isFinite(meta.baseOutlineColor?.alpha) ? meta.baseOutlineColor.alpha : 0.95,
+        outlineOpacity: 0.8,
         hiddenInstanceIndices: hiddenIndices,
         columnActive: meta.columnActive,
         appendMode: true,
@@ -530,6 +859,233 @@ export const useMapStore = defineStore('map', {
         const entity = this.viewer.entities.getById(id)
         if (entity) entity.show = show
       })
+    },
+
+    _buildBeiDouGridDatasetKey(normalizedBounds, gridParams, clipHash, elevationMode = 'terrain', localDemVersion = 0) {
+      const b = normalizedBounds
+      const dx = gridParams?.dx
+      const dy = gridParams?.dy
+      const dz = gridParams?.dz
+      const zMin = gridParams?.zMin
+      const zMax = gridParams?.zMax
+      return [
+        `b=${b.minLon.toFixed(7)},${b.minLat.toFixed(7)},${b.maxLon.toFixed(7)},${b.maxLat.toFixed(7)}`,
+        `dx=${Number(dx).toFixed(4)}`,
+        `dy=${Number(dy).toFixed(4)}`,
+        `dz=${Number(dz).toFixed(4)}`,
+        `zMin=${Number(zMin).toFixed(4)}`,
+        `zMax=${Number(zMax).toFixed(4)}`,
+        `elev=${elevationMode}`,
+        `dem=${Number(localDemVersion)}`,
+        clipHash || 'no-clip'
+      ].join('|')
+    },
+
+    /**
+     * 准备（或复用）格网数据集：柱掩膜 + 地形采样。三种渲染模式共享同一 dataset。
+     * @returns {Promise<{ key: string, normalizedBounds: any, dx:number,dy:number,dz:number,zMin:number,zMax:number,gridX:number,gridY:number,gridZ:number,originLon:number,originLat:number,originGroundHeight:number,groundHeights:Float32Array,columnActive:Float32Array,activeColumns:number,activeCellTotal:number,bboxCellTotal:number }>}
+     */
+    async prepareBeiDouGridDataset(bounds, gridParams, options = {}) {
+      if (!this.viewer) return null
+      const normalizedBounds = normalizeBounds(bounds)
+      if (!normalizedBounds) return null
+
+      const {
+        dx,
+        dy,
+        dz,
+        zMin,
+        zMax,
+        onTerrainSampleProgress,
+        elevationMode = 'terrain'
+      } = gridParams || {}
+      if (![dx, dy, dz, zMin, zMax].every(Number.isFinite)) return null
+
+      const centerLatDeg = (normalizedBounds.minLat + normalizedBounds.maxLat) * 0.5
+      const centerLatRad = Cesium.Math.toRadians(centerLatDeg)
+      const metersPerDegLat = 111000.0
+      const metersPerDegLon = 111000.0 * Math.cos(centerLatRad)
+      const rawWidthM = Math.max(0.0, (normalizedBounds.maxLon - normalizedBounds.minLon) * metersPerDegLon)
+      const rawHeightM = Math.max(0.0, (normalizedBounds.maxLat - normalizedBounds.minLat) * metersPerDegLat)
+
+      const gridZ = Math.max(1, Math.ceil((zMax - zMin) / dz))
+      const gridX = Math.max(1, Math.ceil(rawWidthM / dx))
+      const gridY = Math.max(1, Math.ceil(rawHeightM / dy))
+      const bboxCellTotal = gridX * gridY * gridZ
+
+      const sr = this.selectedRegion
+      const bEq =
+        sr?.bounds &&
+        Math.abs((sr.bounds.minX ?? sr.bounds.minLon) - normalizedBounds.minLon) < 1e-7 &&
+        Math.abs((sr.bounds.minY ?? sr.bounds.minLat) - normalizedBounds.minLat) < 1e-7 &&
+        Math.abs((sr.bounds.maxX ?? sr.bounds.maxLon) - normalizedBounds.maxLon) < 1e-7 &&
+        Math.abs((sr.bounds.maxY ?? sr.bounds.maxLat) - normalizedBounds.maxLat) < 1e-7
+      const clip = bEq && sr?.clipGeoJson?.type === 'MultiPolygon' ? sr.clipGeoJson : null
+      const rawClipCoords =
+        clip?.coordinates && Array.isArray(clip.coordinates) && clip.coordinates.length
+          ? clip.coordinates
+          : null
+      const clipHash = hashClipCoordinates(rawClipCoords)
+      const resolvedElevationMode = elevationMode === 'localDem' ? 'localDem' : 'terrain'
+      const key = this._buildBeiDouGridDatasetKey(
+        normalizedBounds,
+        gridParams,
+        clipHash,
+        resolvedElevationMode,
+        resolvedElevationMode === 'localDem' ? this.localDemVersion : 0
+      )
+
+      const cached = this.beiDouGridDatasetCache?.get?.(key)
+      if (cached) {
+        return cached
+      }
+
+      // 1) 柱掩膜（同一个 key 只算一次：后端优先，失败回退前端）
+      let columnActive = null
+      if (gridParams.columnActive && gridParams.columnActive.length === gridX * gridY) {
+        columnActive =
+          gridParams.columnActive instanceof Float32Array
+            ? gridParams.columnActive
+            : Float32Array.from(gridParams.columnActive)
+      } else if (rawClipCoords) {
+        try {
+          const maskResult = await runColumnMaskJobAndWait({
+            minLon: normalizedBounds.minLon,
+            minLat: normalizedBounds.minLat,
+            maxLon: normalizedBounds.maxLon,
+            maxLat: normalizedBounds.maxLat,
+            dx,
+            dy,
+            gridX,
+            gridY,
+            clipMultiPolygonCoordinates: rawClipCoords
+          })
+          columnActive = decodeColumnActiveFloat32B64(maskResult.columnActiveB64)
+          if (columnActive.length !== gridX * gridY) {
+            throw new Error('columnActive length mismatch')
+          }
+        } catch (e) {
+          console.warn('[map] 后端柱掩膜失败，改在前端计算（可能短暂卡顿）', e)
+          const multiCoordsLocal = simplifyMultiPolygonCoordinates(rawClipCoords, 2500)
+          columnActive = buildColumnActiveMask({
+            originLon: normalizedBounds.minLon,
+            originLat: normalizedBounds.minLat,
+            gridX,
+            gridY,
+            dx,
+            dy,
+            centerLatDeg,
+            multiPolygonCoordinates: multiCoordsLocal
+          })
+        }
+      } else {
+        columnActive = buildColumnActiveMask({
+          originLon: normalizedBounds.minLon,
+          originLat: normalizedBounds.minLat,
+          gridX,
+          gridY,
+          dx,
+          dy,
+          centerLatDeg,
+          multiPolygonCoordinates: null
+        })
+      }
+
+      let activeColumns = 0
+      for (let c = 0; c < columnActive.length; c++) {
+        if (columnActive[c] > 0.5) activeColumns++
+      }
+      const activeCellTotal = activeColumns * gridZ
+
+      // 2) 高程采样（同一个 key 只采样一次）
+      const originLon = normalizedBounds.minLon
+      const originLat = normalizedBounds.minLat
+      let sampledResult = null
+      if (resolvedElevationMode === 'localDem') {
+        if (!this.localDemFile) {
+          throw new Error('本地DEM模式未加载GeoTIFF，请先在格网生成实验中加载DEM文件')
+        }
+        sampledResult = await sampleGridGroundHeightsFromLocalDem(
+          this.localDemFile,
+          normalizedBounds,
+          originLon,
+          originLat,
+          dx,
+          dy,
+          gridX,
+          gridY,
+          {
+            defaultHeight: 0,
+            columnActive,
+            onProgress: onTerrainSampleProgress
+          }
+        )
+      } else {
+        sampledResult = await sampleGridGroundHeights(
+          this.viewer,
+          normalizedBounds,
+          originLon,
+          originLat,
+          dx,
+          dy,
+          gridX,
+          gridY,
+          {
+            batchSize: options.batchSize ?? 500,
+            defaultHeight: 0,
+            columnActive,
+            onProgress: onTerrainSampleProgress
+          }
+        )
+      }
+      const { originGroundHeight, groundHeights } = sampledResult
+
+      const dataset = markRaw({
+        type: 'beidou-grid-dataset',
+        key,
+        normalizedBounds,
+        dx,
+        dy,
+        dz,
+        zMin,
+        zMax,
+        gridX,
+        gridY,
+        gridZ,
+        bboxCellTotal,
+        activeColumns,
+        activeCellTotal,
+        originLon,
+        originLat,
+        originGroundHeight,
+        groundHeights: markRaw(groundHeights),
+        columnActive: markRaw(new Float32Array(columnActive)),
+        clipHash,
+        elevationMode: resolvedElevationMode,
+        createdAt: Date.now()
+      })
+      try {
+        this.beiDouGridDatasetCache.set(key, dataset)
+        // 简单容量控制：避免长时间跑批导致内存无限增长
+        const MAX_CACHE_ITEMS = 25
+        if (this.beiDouGridDatasetCache.size > MAX_CACHE_ITEMS) {
+          let oldestKey = null
+          let oldestTs = Number.POSITIVE_INFINITY
+          for (const [k, v] of this.beiDouGridDatasetCache.entries()) {
+            const ts = v?.createdAt
+            if (Number.isFinite(ts) && ts < oldestTs) {
+              oldestTs = ts
+              oldestKey = k
+            }
+          }
+          if (oldestKey && oldestKey !== key) {
+            this.beiDouGridDatasetCache.delete(oldestKey)
+          }
+        }
+      } catch (e) {
+        // ignore cache set failures
+      }
+      return dataset
     },
 
     /**
@@ -549,17 +1105,11 @@ export const useMapStore = defineStore('map', {
         this.clearBeiDouResultGrid()
       }
 
-      // bounds 兼容：可能是 minX/minY/maxX/maxY
-      const b = bounds || {}
-      const minLon = b.minX ?? b.minLon
-      const minLat = b.minY ?? b.minLat
-      const maxLon = b.maxX ?? b.maxLon
-      const maxLat = b.maxY ?? b.maxLat
-      if (![minLon, minLat, maxLon, maxLat].every(Number.isFinite)) {
+      const normalizedBounds = normalizeBounds(bounds)
+      if (!normalizedBounds) {
         console.warn('[map] showBeiDouGrid: bounds 无效，格网未渲染。', bounds)
         return null
       }
-      const normalizedBounds = { minLon, minLat, maxLon, maxLat }
 
       const {
         dx,
@@ -571,13 +1121,16 @@ export const useMapStore = defineStore('map', {
         fillOpacity,
         outlineColor,
         outlineOpacity,
-        hiddenInstanceIndices
+        hiddenInstanceIndices,
+        onTerrainSampleProgress,
+        renderModeOverride,
+        elevationMode = 'terrain'
       } = gridParams
 
       const __debugBeiDou = !!import.meta.env?.DEV
       if (__debugBeiDou) {
         console.groupCollapsed('[BeiDouGrid] showBeiDouGrid')
-        console.log('📊 Grid Params:', { dx, dy, dz, zMin, zMax, bounds: normalizedBounds })
+        console.log('📊 Grid Params:', { dx, dy, dz, zMin, zMax, bounds: normalizedBounds, renderModeOverride })
       }
 
       const centerLatDeg = (normalizedBounds.minLat + normalizedBounds.maxLat) * 0.5
@@ -593,74 +1146,20 @@ export const useMapStore = defineStore('map', {
       const gridY = Math.max(1, Math.ceil(rawHeightM / dy))
       const bboxCellTotal = gridX * gridY * gridZ
 
-      const sr = this.selectedRegion
-      const bEq =
-        sr?.bounds &&
-        Math.abs((sr.bounds.minX ?? sr.bounds.minLon) - minLon) < 1e-7 &&
-        Math.abs((sr.bounds.minY ?? sr.bounds.minLat) - minLat) < 1e-7 &&
-        Math.abs((sr.bounds.maxX ?? sr.bounds.maxLon) - maxLon) < 1e-7 &&
-        Math.abs((sr.bounds.maxY ?? sr.bounds.maxLat) - maxLat) < 1e-7
-      const clip = bEq && sr?.clipGeoJson?.type === 'MultiPolygon' ? sr.clipGeoJson : null
-      const rawClipCoords =
-        clip?.coordinates && Array.isArray(clip.coordinates) && clip.coordinates.length
-          ? clip.coordinates
-          : null
-
-      let columnActive
-      if (gridParams.columnActive && gridParams.columnActive.length === gridX * gridY) {
-        columnActive =
-          gridParams.columnActive instanceof Float32Array
-            ? gridParams.columnActive
-            : Float32Array.from(gridParams.columnActive)
-      } else if (rawClipCoords) {
-        try {
-          const maskResult = await runColumnMaskJobAndWait({
-            minLon,
-            minLat,
-            maxLon,
-            maxLat,
-            dx,
-            dy,
-            gridX,
-            gridY,
-            clipMultiPolygonCoordinates: rawClipCoords
-          })
-          columnActive = decodeColumnActiveFloat32B64(maskResult.columnActiveB64)
-          if (columnActive.length !== gridX * gridY) {
-            throw new Error('columnActive length mismatch')
-          }
-        } catch (e) {
-          console.warn('[map] 后端柱掩膜失败，改在前端计算（可能短暂卡顿）', e)
-          const multiCoordsLocal = simplifyMultiPolygonCoordinates(rawClipCoords, 2500)
-          columnActive = buildColumnActiveMask({
-            originLon: minLon,
-            originLat: minLat,
-            gridX,
-            gridY,
-            dx,
-            dy,
-            centerLatDeg,
-            multiPolygonCoordinates: multiCoordsLocal
-          })
-        }
-      } else {
-        columnActive = buildColumnActiveMask({
-          originLon: minLon,
-          originLat: minLat,
-          gridX,
-          gridY,
-          dx,
-          dy,
-          centerLatDeg,
-          multiPolygonCoordinates: null
-        })
-      }
-
-      let activeColumns = 0
-      for (let c = 0; c < columnActive.length; c++) {
-        if (columnActive[c] > 0.5) activeColumns++
-      }
-      const activeCellTotal = activeColumns * gridZ
+      const dataset = await this.prepareBeiDouGridDataset(normalizedBounds, {
+        ...gridParams,
+        dx,
+        dy,
+        dz,
+        zMin,
+        zMax,
+        onTerrainSampleProgress,
+        elevationMode
+      })
+      if (!dataset) return null
+      const columnActive = dataset.columnActive
+      const activeColumns = dataset.activeColumns
+      const activeCellTotal = dataset.activeCellTotal
       const total = bboxCellTotal
 
       if (activeColumns === 0) {
@@ -669,7 +1168,16 @@ export const useMapStore = defineStore('map', {
       }
 
       const MAX_GEOMETRY_INSTANCES = 120000
-      const useInstancing = total > MAX_GEOMETRY_INSTANCES
+      const normalizedRenderModeOverride =
+        renderModeOverride === 'geometryInstances' || renderModeOverride === 'instanced'
+          ? renderModeOverride
+          : 'auto'
+      const useInstancing =
+        normalizedRenderModeOverride === 'instanced'
+          ? true
+          : normalizedRenderModeOverride === 'geometryInstances'
+            ? false
+            : total > MAX_GEOMETRY_INSTANCES
       let renderedCount = 0
       const capped = false
       const hiddenFlags =
@@ -689,25 +1197,25 @@ export const useMapStore = defineStore('map', {
         console.log('🧮 Grid Derived:', { gridX, gridY, gridZ, total, useInstancing })
       }
 
-      const originLon = normalizedBounds.minLon
-      const originLat = normalizedBounds.minLat
+      const originLon = dataset.originLon
+      const originLat = dataset.originLat
 
-      // 采样地形高度：用户输入的 zMin/zMax 是“离地高度（相对 terrain）”，
-      // 因此需要把每个 (ix,iy) 柱的地形高度 groundHeight 映射到 ENU 的 Up 轴偏移。
-      const { originGroundHeight, groundHeights } = await sampleGridGroundHeights(
-        this.viewer,
-        normalizedBounds,
-        originLon,
-        originLat,
-        dx,
-        dy,
-        gridX,
-        gridY,
-        { batchSize: 200, defaultHeight: 0 }
-      )
+      // 采样地形高度（dataset 内为真实椭球高程，供后端分析）；渲染时按 Globe 夸张系数变换以贴合当前地形显示
+      const originGroundHeightRaw = dataset.originGroundHeight
+      const groundHeightsRaw = dataset.groundHeights
+      const isTerrainDataset = dataset.elevationMode !== 'localDem'
+      const globeRg = isTerrainDataset ? toRaw(this.viewer)?.scene?.globe : null
+      const originGroundHeightRender = applyGlobeTerrainExaggerationToHeightMeters(originGroundHeightRaw, globeRg)
+      let groundHeightsRender = groundHeightsRaw
+      if (groundHeightsRaw && groundHeightsRaw.length === gridX * gridY) {
+        groundHeightsRender = new Float32Array(groundHeightsRaw.length)
+        for (let gi = 0; gi < groundHeightsRaw.length; gi++) {
+          groundHeightsRender[gi] = applyGlobeTerrainExaggerationToHeightMeters(groundHeightsRaw[gi], globeRg)
+        }
+      }
 
       const zMinRel = zMin
-      const originCartesian = Cesium.Cartesian3.fromDegrees(originLon, originLat, originGroundHeight)
+      const originCartesian = Cesium.Cartesian3.fromDegrees(originLon, originLat, originGroundHeightRender)
       const originENU = Cesium.Transforms.eastNorthUpToFixedFrame(originCartesian)
 
       // debug-only origin print removed (kept minimal)
@@ -750,11 +1258,11 @@ export const useMapStore = defineStore('map', {
           for (let iy = 0; iy < gridY; iy++) {
             const colIndex = iy * gridX + ix
             if (columnActive[colIndex] < 0.5) continue
-            const groundH = groundHeights?.[colIndex] ?? originGroundHeight
+            const groundH = groundHeightsRender?.[colIndex] ?? originGroundHeightRender
             for (let iz = 0; iz < gridZ; iz++) {
               const instanceIndex = iz * gridX * gridY + iy * gridX + ix
               if (hiddenFlags && hiddenFlags[instanceIndex] === 1) continue
-              const centerZRel = zMinRel + (iz + 0.5) * dz + (groundH - originGroundHeight)
+              const centerZRel = zMinRel + (iz + 0.5) * dz + (groundH - originGroundHeightRender)
               const localTranslation = new Cesium.Cartesian3(
                 (ix + 0.5) * dx,
                 (iy + 0.5) * dy,
@@ -805,9 +1313,10 @@ export const useMapStore = defineStore('map', {
           }),
           asynchronous: true
         })
-        this.viewer.scene.primitives.add(primitive)
-        if (saveAsResultLayer) this.beiDouGridResultPrimitive = primitive
-        else this.beiDouGridPrimitive = primitive
+        const primitiveRaw = markRaw(primitive)
+        this.viewer.scene.primitives.add(primitiveRaw)
+        if (saveAsResultLayer) this.beiDouGridResultPrimitive = primitiveRaw
+        else this.beiDouGridPrimitive = primitiveRaw
 
         let outlinePrimitive = null
         if (outlineGeometryInstances.length > 0) {
@@ -819,6 +1328,7 @@ export const useMapStore = defineStore('map', {
             }),
             asynchronous: true
           })
+          outlinePrimitive = markRaw(outlinePrimitive)
           this.viewer.scene.primitives.add(outlinePrimitive)
         }
         if (saveAsResultLayer) this.beiDouGridResultOutlinePrimitive = outlinePrimitive
@@ -832,8 +1342,8 @@ export const useMapStore = defineStore('map', {
           { dx, dy, dz, zMin, zMax },
           {
             origin: 'minCorner',
-            originGroundHeight,
-            groundHeights,
+            originGroundHeight: originGroundHeightRender,
+            groundHeights: groundHeightsRender,
             gridX,
             gridY,
             gridZ,
@@ -865,14 +1375,15 @@ export const useMapStore = defineStore('map', {
           }
         )
 
-        scene.primitives.add(primitive)
+        const primitiveRaw = markRaw(primitive)
+        scene.primitives.add(primitiveRaw)
         if (saveAsResultLayer) {
-          this.beiDouGridResultPrimitive = primitive
-          this.beiDouGridResultInstancedPrimitives = [primitive]
+          this.beiDouGridResultPrimitive = primitiveRaw
+          this.beiDouGridResultInstancedPrimitives = [primitiveRaw]
           this.beiDouGridResultOutlinePrimitive = null
         } else {
-          this.beiDouGridPrimitive = primitive
-          this.beiDouGridInstancedPrimitives = [primitive]
+          this.beiDouGridPrimitive = primitiveRaw
+          this.beiDouGridInstancedPrimitives = [primitiveRaw]
           this.beiDouGridOutlinePrimitive = null
         }
         renderedCount = activeCellTotal
@@ -889,20 +1400,21 @@ export const useMapStore = defineStore('map', {
           zMax,
           zMinRel: zMin,
           zMaxRel: zMax,
-          // ENU 原点（originLon,originLat）处：绝对椭球高度 = originGroundHeight + zMin
-          zStartAbsOrigin: originGroundHeight + zMin,
+          // ENU 原点（originLon,originLat）处：真实采样椭球高度 + zMin（与后端分析一致，不含地形夸张）
+          zStartAbsOrigin: originGroundHeightRaw + zMin,
           gridX,
           gridY,
           gridZ,
           renderedCount,
           renderStep: 1,
-          originGroundHeight,
+          originGroundHeight: originGroundHeightRaw,
           originLon,
           originLat,
           originCartesian,
           originENU,
-          groundHeights,
+          groundHeights: groundHeightsRaw,
           columnActive: new Float32Array(columnActive),
+          elevationMode: dataset.elevationMode || elevationMode,
           activeColumns,
           activeCellTotal,
           bboxCellTotal,
@@ -940,19 +1452,19 @@ export const useMapStore = defineStore('map', {
       if (!this.viewer) return
 
       const removePrimitiveSafe = (primitive) => {
-        if (!primitive) return
+        const rawPrimitive = toRaw(primitive)
+        if (!rawPrimitive) return
         try {
-          const inScene = this.viewer.scene?.primitives?.contains?.(primitive) === true
-          if (inScene) {
-            this.viewer.scene.primitives.remove(primitive)
-            return
-          }
-          if (typeof primitive.isDestroyed === 'function') {
-            if (!primitive.isDestroyed()) {
-              this.schedulePrimitiveDestroy(primitive)
+          const primitives = this.viewer.scene?.primitives
+          // 先直接尝试从集合移除，避免 contains 在部分对象/版本下不可靠造成漏删。
+          const removed = !!primitives?.remove?.(rawPrimitive)
+          if (removed) return
+          if (typeof rawPrimitive.isDestroyed === 'function') {
+            if (!rawPrimitive.isDestroyed()) {
+              this.schedulePrimitiveDestroy(rawPrimitive)
             }
           } else {
-            this.schedulePrimitiveDestroy(primitive)
+            this.schedulePrimitiveDestroy(rawPrimitive)
           }
         } catch (e) {
           // 忽略已销毁对象的错误
@@ -981,6 +1493,7 @@ export const useMapStore = defineStore('map', {
       this.beiDouGridSelectedPrimitive = null
       this.selectedBeiDouCellId = null
       this.selectedBeiDouCellInfo = null
+      this.signalStrengthLayer = null
 
       this.beiDouLastCompactResult = null
     },
@@ -1082,22 +1595,31 @@ export const useMapStore = defineStore('map', {
             dx: metaDx,
             dy: metaDy,
             dz: metaDz,
-            originENU,
-            originGroundHeight,
-            groundHeights,
-            gridX: metaGridX
+            originGroundHeight: ogRawMeta,
+            groundHeights: ghRawMeta,
+            gridX: metaGridX,
+            originLon: olonMeta,
+            originLat: olatMeta
           } = this.beiDouGridMeta
+
+          const globePick = toRaw(this.viewer)?.scene?.globe
+          const originGrMeta = applyGlobeTerrainExaggerationToHeightMeters(ogRawMeta, globePick)
+          const colIndexPick = iy * metaGridX + ix
+          const groundGrMeta = applyGlobeTerrainExaggerationToHeightMeters(
+            ghRawMeta?.[colIndexPick] ?? ogRawMeta,
+            globePick
+          )
+          const originCartesianPick = Cesium.Cartesian3.fromDegrees(olonMeta, olatMeta, originGrMeta)
+          const originENUPick = Cesium.Transforms.eastNorthUpToFixedFrame(originCartesianPick)
 
           let lon = 0, lat = 0, height = 0
           try {
-            const colIndex = iy * metaGridX + ix
-            const groundH = groundHeights?.[colIndex] ?? originGroundHeight
             const localCenter = new Cesium.Cartesian3(
               (ix + 0.5) * metaDx,
               (iy + 0.5) * metaDy,
-              zMinRel + (iz + 0.5) * metaDz + (groundH - originGroundHeight)
+              zMinRel + (iz + 0.5) * metaDz + (groundGrMeta - originGrMeta)
             )
-            const world = Cesium.Matrix4.multiplyByPoint(originENU, localCenter, new Cesium.Cartesian3())
+            const world = Cesium.Matrix4.multiplyByPoint(originENUPick, localCenter, new Cesium.Cartesian3())
             const carto = Cesium.Cartographic.fromCartesian(world)
             lon = Cesium.Math.toDegrees(carto.longitude)
             lat = Cesium.Math.toDegrees(carto.latitude)
@@ -1114,15 +1636,13 @@ export const useMapStore = defineStore('map', {
           // instanced 模式：使用官方 Primitive + GeometryInstance 创建单格线框高亮
           if (isInstanced) {
             try {
-              const colIndex = iy * metaGridX + ix
-              const groundH = groundHeights?.[colIndex] ?? originGroundHeight
               const localTranslation = new Cesium.Cartesian3(
                 (ix + 0.5) * metaDx,
                 (iy + 0.5) * metaDy,
-                zMinRel + (iz + 0.5) * metaDz + (groundH - originGroundHeight)
+                zMinRel + (iz + 0.5) * metaDz + (groundGrMeta - originGrMeta)
               )
               const modelMatrix = Cesium.Matrix4.multiplyByTranslation(
-                originENU,
+                originENUPick,
                 localTranslation,
                 new Cesium.Matrix4()
               )

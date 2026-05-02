@@ -1,0 +1,13 @@
+flowchart LR
+    inputN["输入: 活跃格元数 N"] --> decision{"N < 1.2×10^5 ?"}
+
+    decision -->|是| smallMode["分支A(小规模)\nGeometryInstance + scene.pick"]
+    decision -->|否| largeMode["分支B(大规模)\nGPU Instancing + 离屏ID编码"]
+
+    smallMode --> pickA["统一拾取结果对象"]
+    largeMode --> pickB["统一拾取结果对象"]
+    pickA --> output["输出: cellId + 坐标 + 属性"]
+    pickB --> output
+
+    smallMode -.-> costA["Draw Call: O(N)"]
+    largeMode -.-> costB["Draw Call: O(1)"]

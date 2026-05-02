@@ -149,6 +149,9 @@
           生成格网
         </el-button>
         <el-button @click="resetForm">重置</el-button>
+        <div v-if="isGenerating && terrainProgressText" class="terrain-progress">
+          {{ terrainProgressText }}
+        </div>
       </el-form-item>
 
       <el-form-item v-if="gridInfo.pointCount > 0" label="格网信息">
@@ -174,16 +177,16 @@ const analysisStore = useAnalysisStore()
 const mapStore = useMapStore()
 
 const form = reactive({
-  dx: 100,
-  dy: 100,
-  dz: 50,
+  dx: 500,
+  dy: 500,
+  dz: 100,
   zMin: 0,
   zMax: 500,
   autoUseDSMBounds: true,
   fillColor: '#00e0ff',
   fillOpacity: 0.05,
   outlineColor: '#00e0ff',
-  outlineOpacity: 0.95,
+  outlineOpacity: 0.8,
   bounds: {
     minLon: 114.0,
     maxLon: 114.1,
@@ -193,6 +196,7 @@ const form = reactive({
 })
 
 const isGenerating = ref(false)
+const terrainProgressText = ref('')
 const gridInfo = ref({
   pointCount: 0,
   layerCount: 0,
@@ -237,6 +241,7 @@ const generateGrid = async () => {
   }
 
   isGenerating.value = true
+  terrainProgressText.value = ''
   ElMessage.info('正在生成格网（将采样地形高程以贴地）...')
 
   try {
@@ -250,7 +255,11 @@ const generateGrid = async () => {
       fillColor: form.fillColor,
       fillOpacity: form.fillOpacity,
       outlineColor: form.outlineColor,
-      outlineOpacity: form.outlineOpacity
+      outlineOpacity: form.outlineOpacity,
+      onTerrainSampleProgress: ({ current, total }) => {
+        terrainProgressText.value =
+          total > 0 ? `地形采样进度：${current.toLocaleString()} / ${total.toLocaleString()} 柱` : ''
+      }
     })
     if (primitiveInfo == null) {
       ElMessage.warning('地图未就绪，格网未渲染。请等待 3D 地图加载完成后再点击「生成格网」。')
@@ -280,20 +289,21 @@ const generateGrid = async () => {
     ElMessage.error(`格网生成失败：${e?.message || '未知错误'}`)
   } finally {
     isGenerating.value = false
+    terrainProgressText.value = ''
   }
 }
 
 const resetForm = () => {
-  form.dx = 100
-  form.dy = 100
-  form.dz = 50
+  form.dx = 500
+  form.dy = 500
+  form.dz = 100
   form.zMin = 0
   form.zMax = 500
   form.autoUseDSMBounds = true
   form.fillColor = '#00e0ff'
   form.fillOpacity = 0.05
   form.outlineColor = '#00e0ff'
-  form.outlineOpacity = 0.95
+  form.outlineOpacity = 0.8
   gridInfo.value = {
     pointCount: 0,
     layerCount: 0,
@@ -352,7 +362,7 @@ const handleOutlineStyleChange = () => {
         ? Cesium.Color.fromCssColorString(form.outlineColor)
         : Cesium.Color.BLACK
       ).withAlpha(
-        typeof form.outlineOpacity === 'number' ? form.outlineOpacity : 0.95
+        typeof form.outlineOpacity === 'number' ? form.outlineOpacity : 0.8
       )
 
       mapStore.beiDouGridMeta.outlineColor = color
@@ -381,7 +391,7 @@ const handleOutlineStyleChange = () => {
       ? Cesium.Color.fromCssColorString(form.outlineColor)
       : Cesium.Color.BLACK
     ).withAlpha(
-      typeof form.outlineOpacity === 'number' ? form.outlineOpacity : 0.95
+      typeof form.outlineOpacity === 'number' ? form.outlineOpacity : 0.8
     )
 
     for (let ix = 0; ix < gridX; ix++) {
@@ -442,6 +452,13 @@ const handleOutlineStyleChange = () => {
   font-size: 12px;
   color: #666;
   line-height: 1.8;
+}
+
+.terrain-progress {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #606266;
+  line-height: 1.5;
 }
 </style>
 

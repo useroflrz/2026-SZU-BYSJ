@@ -10,6 +10,8 @@
 
 import * as Cesium from 'cesium'
 
+export const SIGNAL_STATION_HARD_LIMIT = 1000
+
 // WebGL 规范保证的每次 instanced draw 最大实例数，超过则分批
 const MAX_INSTANCES_PER_DRAW = 65535
 
@@ -60,14 +62,30 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
   const originGroundHeight = options.originGroundHeight ?? 0
   const groundHeights = options.groundHeights ?? null
 
+  const colActiveForGround = options.columnActive
+  const useColMaskForGround =
+    colActiveForGround &&
+    (colActiveForGround.length === gridX * gridY ||
+      (typeof colActiveForGround.length === 'number' && colActiveForGround.length >= gridX * gridY))
+
   let groundMin = originGroundHeight
   let groundMax = originGroundHeight
   if (groundHeights && groundHeights.length === gridX * gridY) {
-    for (let i = 0; i < groundHeights.length; i++) {
-      const h = groundHeights[i]
-      if (!Number.isFinite(h)) continue
-      if (h < groundMin) groundMin = h
-      if (h > groundMax) groundMax = h
+    if (useColMaskForGround) {
+      for (let i = 0; i < groundHeights.length; i++) {
+        if (colActiveForGround[i] < 0.5) continue
+        const h = groundHeights[i]
+        if (!Number.isFinite(h)) continue
+        if (h < groundMin) groundMin = h
+        if (h > groundMax) groundMax = h
+      }
+    } else {
+      for (let i = 0; i < groundHeights.length; i++) {
+        const h = groundHeights[i]
+        if (!Number.isFinite(h)) continue
+        if (h < groundMin) groundMin = h
+        if (h > groundMax) groundMax = h
+      }
     }
   } else {
     // 若 groundHeights 不合法，则退化为“椭球高度”（groundHeights - originGroundHeight 恒为 0）
@@ -127,36 +145,49 @@ export function createGridInstancesFromBounds(bounds, gridParams, options = {}) 
     (colActive.length === gridX * gridY ||
       (typeof colActive.length === 'number' && colActive.length >= gridX * gridY))
 
-  for (let iz = 0; iz < gridZ; iz++) {
-    for (let iy = 0; iy < gridY; iy++) {
-      for (let ix = 0; ix < gridX; ix++) {
-        const localX = (ix + 0.5) * dx
-        const localY = (iy + 0.5) * dy
-        // 单元中心高度（相对 ENU 原点的 Up 轴偏移）
-        // 用户输入 zMin/zMax 是“离地高度(相对 terrain)”，因此中心 Z 需要叠加 groundHeight 差值。
-        const colIndex = iy * gridX + ix
-        const groundH =
-          groundHeights && groundHeights.length === gridX * gridY
-            ? groundHeights[colIndex]
-            : originGroundHeight
+  // 柱被掩膜剔除时：整块柱的 gridZ 个实例共享同一“零缩放”世界矩阵，避免逐层 Matrix4 运算。
+  Cesium.Matrix4.fromTranslation(Cesium.Cartesian3.ZERO, scratchTranslation)
+  scratchTranslation[0] = 0
+  scratchTranslation[5] = 0
+  scratchTranslation[10] = 0
+  Cesium.Matrix4.multiply(originENU, scratchTranslation, scratchInstanceMatrix)
+  const hiddenMatrixFlat = new Float32Array(16)
+  Cesium.Matrix4.toArray(scratchInstanceMatrix, hiddenMatrixFlat)
+
+  const planeStride = gridX * gridY
+  for (let iy = 0; iy < gridY; iy++) {
+    for (let ix = 0; ix < gridX; ix++) {
+      const colIndex = iy * gridX + ix
+      if (useColMask && colActive[colIndex] < 0.5) {
+        const baseCol = iy * gridX + ix
+        for (let iz = 0; iz < gridZ; iz++) {
+          const instanceIndex = iz * planeStride + baseCol
+          matrixData.set(hiddenMatrixFlat, instanceIndex * 16)
+        }
+        continue
+      }
+
+      const localX = (ix + 0.5) * dx
+      const localY = (iy + 0.5) * dy
+      const groundH =
+        groundHeights && groundHeights.length === gridX * gridY
+          ? groundHeights[colIndex]
+          : originGroundHeight
+
+      for (let iz = 0; iz < gridZ; iz++) {
         const localZ = zMin + (iz + 0.5) * dz + (groundH - originGroundHeight)
         Cesium.Matrix4.fromTranslation(new Cesium.Cartesian3(localX, localY, localZ), scratchTranslation)
 
-        // 退化矩阵：将盒体缩放为 0（不改 shader，实现“不可见”）
-        const instanceIndex = iz * gridX * gridY + iy * gridX + ix
-        let hide =
-          hiddenInstanceFlags && hiddenInstanceFlags[instanceIndex] === 1
-        if (useColMask && colActive[colIndex] < 0.5) hide = true
+        const instanceIndex = iz * planeStride + colIndex
+        let hide = hiddenInstanceFlags && hiddenInstanceFlags[instanceIndex] === 1
         if (hide) {
-          // 注意：Matrix4 的对角线元素对应缩放（Cesium 内部矩阵表示）
           scratchTranslation[0] = 0
           scratchTranslation[5] = 0
           scratchTranslation[10] = 0
         }
         Cesium.Matrix4.multiply(originENU, scratchTranslation, scratchInstanceMatrix)
         Cesium.Matrix4.toArray(scratchInstanceMatrix, matrixArray)
-        const base = instanceIndex * 16
-        matrixData.set(matrixArray, base)
+        matrixData.set(matrixArray, instanceIndex * 16)
       }
     }
   }
@@ -210,10 +241,12 @@ attribute vec4 instanceMatrix3;
 attribute float instanceVisible;
 varying vec3 v_localPos;
 varying float v_instanceVisible;
+varying vec3 v_worldCenter;
 void main() {
   mat4 instanceMatrix = mat4(instanceMatrix0, instanceMatrix1, instanceMatrix2, instanceMatrix3);
   v_localPos = position;
   v_instanceVisible = instanceVisible;
+  v_worldCenter = (instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
   gl_Position = czm_viewProjection * instanceMatrix * vec4(position, 1.0);
 }
 `
@@ -234,6 +267,22 @@ uniform float u_wireframeEdgeRatio;
 uniform float u_lineWidthPx;
 varying vec3 v_localPos;
 varying float v_instanceVisible;
+varying vec3 v_worldCenter;
+
+// signal strength uniforms (FSPL-based)
+#define MAX_SIGNAL_STATIONS ${SIGNAL_STATION_HARD_LIMIT}
+uniform float u_signalMode;
+uniform float u_signalAlpha;
+uniform float u_freqMHz;
+uniform float u_minDistM;
+uniform float u_maxDistM;
+uniform float u_signalGamma;
+uniform float u_signalBands;
+uniform float u_eirpDbm;
+uniform float u_rxGainDbi;
+uniform float u_miscLossDb;
+uniform float u_stationCount;
+uniform vec3 u_stationPositions[MAX_SIGNAL_STATIONS];
 
 float edgeMaskFromLocalPos(vec3 localPos, vec3 halfSize, float edgeRatio) {
   vec3 safeHalf = max(halfSize, vec3(0.0001));
@@ -275,7 +324,32 @@ void main() {
 #else
   edgeMask = edgeMaskFromLocalPos(v_localPos, u_halfSize, u_wireframeEdgeRatio) * u_wireframeShow;
 #endif
-  vec4 mixedColor = mix(u_fillColor, u_outlineColor, edgeMask);
+  vec4 baseFill = u_fillColor;
+  if (u_signalMode > 0.5) {
+    float bestD = 1e20;
+    float dMin = max(u_minDistM, 0.1);
+    float dMax = max(u_maxDistM, dMin + 0.1);
+    float count = clamp(u_stationCount, 0.0, float(MAX_SIGNAL_STATIONS));
+    for (int i = 0; i < MAX_SIGNAL_STATIONS; i++) {
+      if (float(i) >= count) break;
+      vec3 s = u_stationPositions[i];
+      float di = length(v_worldCenter - s);
+      bestD = min(bestD, di);
+    }
+    bestD = clamp(bestD, dMin, dMax);
+    // 对数距离映射：避免把「最强」锚在过近距离时，绝大部分格元都挤在红色端
+    float tMap = 1.0 - (log(bestD / dMin) / max(1e-6, log(dMax / dMin)));
+    tMap = clamp(tMap, 0.0, 1.0);
+    float g = max(u_signalGamma, 0.2);
+    tMap = pow(max(tMap, 1e-5), g);
+    if (u_signalBands >= 1.5) {
+      float n = floor(u_signalBands + 0.5);
+      tMap = floor(tMap * n) / max(n - 1.0, 1.0);
+    }
+    vec3 col = mix(vec3(0.96, 0.35, 0.35), vec3(0.22, 0.78, 0.36), tMap);
+    baseFill = vec4(col, clamp(u_signalAlpha, 0.0, 1.0));
+  }
+  vec4 mixedColor = mix(baseFill, u_outlineColor, edgeMask);
   gl_FragColor = mixedColor;
 }
 `
@@ -402,6 +476,23 @@ export class BeiDouGridPrimitive {
     this._pickInstancedExt = null
     this._visibilityByBatch = []
     this._visibilityBuffers = []
+    this._signal = {
+      enabled: false,
+      alpha: 0.12,
+      freqMHz: 1400.0,
+      minDistM: 120.0,
+      maxDistM: 5000.0,
+      signalGamma: 0.4,
+      signalBands: 0.0,
+      eirpDbm: 43.0,
+      rxGainDbi: 0.0,
+      miscLossDb: 0.0,
+      stationsEcef: []
+    }
+    this._signalUniformStations = new Array(SIGNAL_STATION_HARD_LIMIT)
+    for (let i = 0; i < SIGNAL_STATION_HARD_LIMIT; i++) {
+      this._signalUniformStations[i] = new Cesium.Cartesian3(0.0, 0.0, 0.0)
+    }
   }
 
   get isDestroyed() {
@@ -422,6 +513,56 @@ export class BeiDouGridPrimitive {
     }
     if (Number.isFinite(style.lineWidthPx)) {
       this._wireframe.lineWidthPx = Cesium.Math.clamp(style.lineWidthPx, 0.5, 8.0)
+    }
+  }
+
+  setSignalParams(params = {}) {
+    if (!this._signal) this._signal = {}
+    if (typeof params.enabled === 'boolean') this._signal.enabled = params.enabled
+    if (Number.isFinite(params.alpha)) this._signal.alpha = Cesium.Math.clamp(params.alpha, 0.0, 1.0)
+    if (Number.isFinite(params.freqMHz)) this._signal.freqMHz = Math.max(1.0, params.freqMHz)
+    if (Number.isFinite(params.minDistM)) this._signal.minDistM = Math.max(0.1, params.minDistM)
+    if (Number.isFinite(params.maxDistM)) this._signal.maxDistM = Math.max(this._signal.minDistM + 0.1, params.maxDistM)
+    if (Number.isFinite(params.signalGamma)) {
+      this._signal.signalGamma = Cesium.Math.clamp(params.signalGamma, 0.25, 3.0)
+    }
+    if (Number.isFinite(params.signalBands)) {
+      this._signal.signalBands = Cesium.Math.clamp(params.signalBands, 0.0, 16.0)
+    }
+    if (Number.isFinite(params.eirpDbm)) {
+      this._signal.eirpDbm = Cesium.Math.clamp(params.eirpDbm, -60.0, 90.0)
+    }
+    if (Number.isFinite(params.rxGainDbi)) {
+      this._signal.rxGainDbi = Cesium.Math.clamp(params.rxGainDbi, -20.0, 40.0)
+    }
+    if (Number.isFinite(params.miscLossDb)) {
+      this._signal.miscLossDb = Cesium.Math.clamp(params.miscLossDb, 0.0, 80.0)
+    }
+    if (Array.isArray(params.stationsEcef)) {
+      const out = []
+      for (let i = 0; i < params.stationsEcef.length && out.length < SIGNAL_STATION_HARD_LIMIT; i++) {
+        const p = params.stationsEcef[i]
+        if (!p) continue
+        const x = Number(p.x)
+        const y = Number(p.y)
+        const z = Number(p.z)
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue
+        out.push(new Cesium.Cartesian3(x, y, z))
+      }
+      this._signal.stationsEcef = out
+      for (let i = 0; i < SIGNAL_STATION_HARD_LIMIT; i++) {
+        const src = out[i]
+        const dst = this._signalUniformStations[i]
+        if (src) {
+          dst.x = src.x
+          dst.y = src.y
+          dst.z = src.z
+        } else {
+          dst.x = 0.0
+          dst.y = 0.0
+          dst.z = 0.0
+        }
+      }
     }
   }
 
@@ -686,6 +827,53 @@ export class BeiDouGridPrimitive {
       u_lineWidthPx: () => {
         const w = this._wireframe?.lineWidthPx
         return Number.isFinite(w) ? Cesium.Math.clamp(w, 0.5, 8.0) : lineWidthPxDefault
+      },
+      u_signalMode: () => {
+        return this._signal?.enabled ? 1.0 : 0.0
+      },
+      u_signalAlpha: () => {
+        const a = this._signal?.alpha
+        return Number.isFinite(a) ? Cesium.Math.clamp(a, 0.0, 1.0) : 0.12
+      },
+      u_freqMHz: () => {
+        const f = this._signal?.freqMHz
+        return Number.isFinite(f) ? Math.max(1.0, f) : 1400.0
+      },
+      u_minDistM: () => {
+        const d = this._signal?.minDistM
+        return Number.isFinite(d) ? Math.max(0.1, d) : 120.0
+      },
+      u_maxDistM: () => {
+        const d = this._signal?.maxDistM
+        const minD = Number.isFinite(this._signal?.minDistM) ? Math.max(0.1, this._signal.minDistM) : 10.0
+        return Number.isFinite(d) ? Math.max(minD + 0.1, d) : 5000.0
+      },
+      u_signalGamma: () => {
+        const g = this._signal?.signalGamma
+        return Number.isFinite(g) ? Cesium.Math.clamp(g, 0.25, 3.0) : 0.4
+      },
+      u_signalBands: () => {
+        const b = this._signal?.signalBands
+        return Number.isFinite(b) ? Cesium.Math.clamp(b, 0.0, 16.0) : 0.0
+      },
+      u_eirpDbm: () => {
+        const v = this._signal?.eirpDbm
+        return Number.isFinite(v) ? Cesium.Math.clamp(v, -60.0, 90.0) : 43.0
+      },
+      u_rxGainDbi: () => {
+        const v = this._signal?.rxGainDbi
+        return Number.isFinite(v) ? Cesium.Math.clamp(v, -20.0, 40.0) : 0.0
+      },
+      u_miscLossDb: () => {
+        const v = this._signal?.miscLossDb
+        return Number.isFinite(v) ? Cesium.Math.clamp(v, 0.0, 80.0) : 0.0
+      },
+      u_stationCount: () => {
+        const n = this._signal?.stationsEcef?.length || 0
+        return Math.max(0.0, Math.min(SIGNAL_STATION_HARD_LIMIT, n))
+      },
+      u_stationPositions: () => {
+        return this._signalUniformStations
       }
     }
 

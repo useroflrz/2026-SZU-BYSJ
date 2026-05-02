@@ -41,6 +41,18 @@
               <GridConfig />
             </el-tab-pane>
 
+            <!-- 信号强度 -->
+            <el-tab-pane label="信号强度" name="signal">
+              <SignalStrengthLab />
+            </el-tab-pane>
+
+            <el-tab-pane label="性能实验" name="grid-performance">
+              <GridPerformanceLab />
+            </el-tab-pane>
+            <el-tab-pane label="格网生成实验" name="grid-generation-lab">
+              <GridGenerationLab />
+            </el-tab-pane>
+
             <!-- 分析参数 -->
             <el-tab-pane label="分析参数" name="analysis">
               <AnalysisPanel />
@@ -109,8 +121,11 @@ import MapViewer from './components/MapViewer.vue'
 import RegionSelector from './components/RegionSelector.vue'
 import StationManager from './components/StationManager.vue'
 import GridConfig from './components/GridConfig.vue'
+import GridPerformanceLab from './components/GridPerformanceLab.vue'
+import GridGenerationLab from './components/GridGenerationLab.vue'
 import AnalysisPanel from './components/AnalysisPanel.vue'
 import ResultVisualizer from './components/ResultVisualizer.vue'
+import SignalStrengthLab from './components/SignalStrengthLab.vue'
 import BeiDouCellInfoPanel from './components/BeiDouCellInfoPanel.vue'
 import { QuestionFilled, User, Location, View, ArrowLeft, ArrowRight } from '@element-plus/icons-vue'
 
